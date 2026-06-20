@@ -45,15 +45,16 @@ if not logger.handlers:
     logger.addHandler(h)
     logger.setLevel(logging.INFO)
 
-manager = LlamaServerManager(log_dir="./llama_logs")
+manager = LlamaServerManager()
 
-DEFAULT_CATEGORIES = "person, car, bicycle, dog, cat"
+DEFAULT_CATEGORIES = "hole, stain, tear, cut, knot, weaving_defect"
 DEFAULT_DEFINITIONS = """\
-- person: a human being
-- car: a 4-wheeled motor vehicle
-- bicycle: a 2-wheeled human-powered vehicle
-- dog: a domestic canine
-- cat: a domestic feline
+- hole: missing fabric
+- stain: discoloration only
+- tear: frayed, uneven separation
+- cut: clean cut
+- knot: raise lump
+- weaving_defect: uneven thread density
 """
 
 
