@@ -5,15 +5,18 @@ description = "Interactive test console for assessing Vision-Language Models (VL
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "json-repair>=0.61.0",
-    "matplotlib>=3.11.0",
-    "openai>=2.43.0",
-    "pillow>=12.2.0",
+    "json-repair==0.61.0",
+    "matplotlib==3.11.0",
+    "openai==2.43.0",
+    "pillow==12.2.0",
+    "gradio==6.19.0",
 ]
 
 [project.scripts]
-detection-tester = "app:build_app"
+# Launch the Gradio web interface
+detection-gui = "gui:main"
+# Run the pipeline from the terminal (no GUI required)
+detection-cli = "cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
-
+package-dir = { "" = "src" }
