@@ -760,11 +760,11 @@ def build_app() -> gr.Blocks:
                         server_preset = gr.Dropdown(
                             label="Recommended Model Presets",
                             choices=MODEL_PRESETS,
-                            value="unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL",
+                            value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
                         )
                         server_model_input = gr.Textbox(
                             label="Model GGUF Path or HF Repo ID",
-                            value="unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL",
+                            value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_X",
                             placeholder="e.g. C:/models/qwen.gguf or HF ID",
                         )
                         server_preset.change(handle_preset_change, server_preset, server_model_input)
