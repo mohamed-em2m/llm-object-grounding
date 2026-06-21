@@ -70,7 +70,7 @@ class LlamaServerManager:
             return
 
         cmd = [
-            "./llama.cpp/build/bin/llama-server",
+            "llama-server",
             "-hf", self.model,
             "--host", self.host,
             "--port", str(self.port),

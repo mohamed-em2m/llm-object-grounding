@@ -1,5 +1,5 @@
 [project]
-name = "object-detection-llms-testing"
+name = "llm-object-grounding"
 version = "0.1.0"
 description = "Interactive test console for assessing Vision-Language Models (VLMs) on general Object Detection tasks"
 readme = "README.md"

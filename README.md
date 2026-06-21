@@ -25,8 +25,8 @@ This project is managed with [uv](https://github.com/astral-sh/uv), a fast Pytho
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/mohamed-em2m/object-detection-llms-testing.git
-   cd object-detection-llms-testing
+   git clone https://github.com/mohamed-em2m/llm-object-grounding.git
+   cd llm-object-grounding
    ```
 
 2. **Install dependencies**:
