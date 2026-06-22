@@ -3,19 +3,7 @@ LLM Object Detection Console.
 
 Styled with the dark "terminal" Gradio console look (console_theme.py +
 console.css + console.js) — see references/patterns.md in the
-gradio-api-console skill for the rationale behind each pattern reused here:
-
-  - console_theme.py / console.css   -> shared dark GitHub-style look
-  - panel_header() + .output-panel   -> output panel anatomy (header with
-    copy button, stats bar, scrollable body, hidden raw textbox for JS)
-  - .section-label                   -> lightweight uppercase section dividers
-  - copyOut() (console.js)           -> client-side copy-to-clipboard
-
-This app drives a local process (a llama-server instance) and a multi-round
-detection pipeline rather than a stateless REST API, so the skill's
-bearer-token-auth and history/pagination patterns don't apply here and were
-intentionally left out — see the accompanying note for what was/wasn't
-adopted from the skill.
+gradio-api-console skill for the rationale behind each pattern reused here.
 """
 
 import sys
@@ -28,9 +16,11 @@ import zipfile
 import threading
 import io
 import logging
+import html
 import traceback
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import gradio as gr
@@ -38,10 +28,8 @@ import httpx
 from PIL import Image
 from openai import OpenAI
 
-# console_theme.py / console.css / console.js live alongside this file.
 from interface.console_theme import theme
 
-# Ensure local imports resolve
 src_dir = Path(__file__).parent
 if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
@@ -51,7 +39,7 @@ from detection_pipeline import (
     RoundResult,
     draw_grid,
     DEFAULT_DETECTOR_TEMPLATE,
-    DEFAULT_JUDGE_TEMPLATE
+    DEFAULT_JUDGE_TEMPLATE,
 )
 from llama_server_manager import LlamaServerManager
 
@@ -68,30 +56,26 @@ server_manager: Optional[LlamaServerManager] = None
 server_lock = threading.Lock()
 pipeline_cancel_event = threading.Event()
 
-# Cache batch results in memory to avoid sending huge image payloads via gr.State
-BATCH_CACHE: Dict[str, Dict[str, Any]] = {}
+MAX_CACHED_BATCHES = 3
+BATCH_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 BATCH_CACHE_LOCK = threading.Lock()
 
+LOG_TAIL_BYTES = 8 * 1024
+
 MODEL_PRESETS = [
-   "unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
+    "unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
     "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL",
-    
     "unsloth/gemma-4-31B-it-qat-GGUF:UD-Q4_K_XL",
     "unsloth/gemma-4-31B-it-GGUF:UD-IQ2_M",
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q3_K_M",
-
     "custom",
 ]
 
-# Extra rules on top of console.css: a couple of status-badge variants and
-# a score badge that the base stylesheet doesn't define, since this app's
-# domain (server lifecycle, detection score) doesn't exist in the API
-# console the base CSS was extracted from. Kept as a small appended block
-# rather than forking console.css, per "Asset loading" in patterns.md.
+# Overhauled CSS for a modern, interactive website feel
 EXTRA_CSS = """
 .status-badge { display:inline-block; padding:0.3rem 0.9rem; border-radius:20px;
     font-family:'JetBrains Mono',monospace; font-weight:600; font-size:0.7rem;
-    text-transform:uppercase; letter-spacing:0.06em; }
+    text-transform:uppercase; letter-spacing:0.06em; transition: all 0.2s ease; }
 .badge-running { background:rgba(74,222,128,0.12); color:#4ade80; border:1px solid rgba(74,222,128,0.3); }
 .badge-stopped { background:rgba(125,133,144,0.12); color:#7d8590; border:1px solid rgba(125,133,144,0.3); }
 .badge-starting { background:rgba(251,191,36,0.12); color:#fbbf24; border:1px solid rgba(251,191,36,0.3); }
@@ -101,7 +85,6 @@ EXTRA_CSS = """
     background:rgba(56,189,248,0.1); color:#38bdf8; border:1px solid rgba(56,189,248,0.3);
     font-family:'JetBrains Mono',monospace; font-weight:600; font-size:0.85rem; }
 
-/* Per-image status pills used in the concurrent batch status table */
 .img-status-pill { display:inline-block; padding:0.15rem 0.6rem; border-radius:10px;
     font-family:'JetBrains Mono',monospace; font-weight:600; font-size:0.65rem;
     text-transform:uppercase; letter-spacing:0.04em; white-space:nowrap; }
@@ -110,6 +93,58 @@ EXTRA_CSS = """
 .pill-done { background:rgba(74,222,128,0.12); color:#4ade80; border:1px solid rgba(74,222,128,0.3); }
 .pill-error { background:rgba(248,113,113,0.12); color:#f87171; border:1px solid rgba(248,113,113,0.3); }
 .pill-cancelled { background:rgba(125,133,144,0.12); color:#7d8590; border:1px solid rgba(125,133,144,0.3); }
+
+/* Modern Interactive Elements */
+button.gr-button, .gr-button-primary, .gr-button-secondary {
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    border-radius: 8px !important;
+}
+button.gr-button:hover:not([disabled]) {
+    transform: translateY(-1px) !important;
+    filter: brightness(1.15) !important;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2) !important;
+}
+button.gr-button:active:not([disabled]) {
+    transform: translateY(0) !important;
+}
+
+/* Custom Smooth Progress Bar */
+.custom-progress-wrapper { margin-bottom: 1rem; }
+.custom-progress-track {
+    width: 100%; height: 10px; background: #161b22; border-radius: 6px; overflow: hidden;
+    border: 1px solid #30363d;
+}
+.custom-progress-fill {
+    height: 100%; border-radius: 4px;
+    background: linear-gradient(90deg, #1f6feb, #38bdf8);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.4);
+    transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.custom-progress-text {
+    font-size: 0.75rem; color: #7d8590; margin-top: 0.4rem;
+    font-family: 'JetBrains Mono', monospace; text-align: right;
+}
+
+/* Table Enhancements */
+.batch-status-table tbody tr {
+    transition: background 0.2s ease;
+}
+.batch-status-table tbody tr:hover {
+    background: #161b22 !important;
+}
+
+/* Prevent Image Stretching */
+.gradio-image img {
+    object-fit: contain !important;
+    width: auto !important;
+    max-height: 500px !important;
+    margin: 0 auto !important;
+    border-radius: 8px;
+}
+
+/* Smooth Accordion & Dropdowns */
+.gr-accordion { transition: all 0.3s ease; border-radius: 8px !important; overflow: hidden; }
+.gr-dropdown { transition: all 0.2s ease; border-radius: 6px !important; }
 """
 custom_css = custom_css + EXTRA_CSS
 
@@ -117,6 +152,29 @@ custom_css = custom_css + EXTRA_CSS
 class PipelineCancelledException(Exception):
     """Raised when a user cancels the pipeline mid-run."""
     pass
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _cache_put(batch_id: str, value: Dict[str, Any]) -> None:
+    with BATCH_CACHE_LOCK:
+        BATCH_CACHE[batch_id] = value
+        BATCH_CACHE.move_to_end(batch_id)
+        while len(BATCH_CACHE) > MAX_CACHED_BATCHES:
+            BATCH_CACHE.popitem(last=False)
+
+def _cache_get(batch_id: str) -> Dict[str, Any]:
+    with BATCH_CACHE_LOCK:
+        b = BATCH_CACHE.get(batch_id)
+        if b is not None:
+            BATCH_CACHE.move_to_end(batch_id)
+        return b or {}
+
+def _cache_drop(batch_id: str) -> None:
+    with BATCH_CACHE_LOCK:
+        BATCH_CACHE.pop(batch_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -131,16 +189,11 @@ def zip_results_folder(folder_path: Path) -> Path:
                 zipf.write(file, file.relative_to(folder_path))
     return zip_path
 
-
 def handle_preset_change(preset: str) -> gr.update:
     if preset == "custom":
         return gr.update(value="", visible=True)
     return gr.update(value=preset, visible=True)
 
-
-# Reused for every output panel (Server Logs, Pipeline Logs). `raw_ta_id`
-# must match the elem_id given to the hidden Textbox below it — see
-# references/patterns.md "Output panel anatomy" / "Common pitfalls".
 def panel_header(title: str, raw_ta_id: str) -> str:
     return f"""
 <div class="out-header">
@@ -153,6 +206,22 @@ def panel_header(title: str, raw_ta_id: str) -> str:
   </div>
 </div>"""
 
+def _tail(s: str, n: int = LOG_TAIL_BYTES) -> str:
+    if len(s) <= n:
+        return s
+    return "...[log tail truncated]...\n" + s[-n:]
+
+def _render_progress_bar(pct: int, status: str = "") -> str:
+    pct = max(0, min(100, int(pct)))
+    color = "#4ade80" if pct == 100 else "#38bdf8"
+    return f"""
+    <div class="custom-progress-wrapper">
+        <div class="custom-progress-track">
+            <div class="custom-progress-fill" style="width:{pct}%; background-color:{color};"></div>
+        </div>
+        <div class="custom-progress-text">{status} ({pct}%)</div>
+    </div>
+    """
 
 # ---------------------------------------------------------------------------
 # Server Manager Wrappers
@@ -175,6 +244,7 @@ def start_server_wrapper(model, port, host, enable_thinking, enable_mtp,
                 server_manager.stop_llama_server()
             except Exception as e:
                 print(f"Error stopping old server: {e}")
+            server_manager = None
 
         yield "Configuring server...", \
               '<span class="status-badge badge-starting">INITIALIZING...</span>'
@@ -245,7 +315,6 @@ def start_server_wrapper(model, port, host, enable_thinking, enable_mtp,
         yield "Timed out waiting for the server to report healthy status.", \
               '<span class="status-badge badge-error">TIMEOUT</span>'
 
-
 def stop_server_wrapper():
     global server_manager
     with server_lock:
@@ -260,7 +329,6 @@ def stop_server_wrapper():
         except Exception as e:
             return f"Error stopping server: {e}", \
                    '<span class="status-badge badge-error">STOP ERROR</span>'
-
 
 def get_server_status_and_logs():
     global server_manager
@@ -279,14 +347,12 @@ def get_server_status_and_logs():
         return f"Server is starting or unhealthy.\n\n--- Logs ---\n{logs[-2000:]}", \
                '<span class="status-badge badge-starting">STARTING...</span>'
 
-
 # ---------------------------------------------------------------------------
 # Pipeline Runner
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONCURRENCY = 16
 
-_STATUS_ORDER = {"running": 0, "queued": 1, "error": 2, "done": 3, "cancelled": 4}
 _STATUS_PILL = {
     "queued": '<span class="img-status-pill pill-queued">QUEUED</span>',
     "running": '<span class="img-status-pill pill-running">RUNNING</span>',
@@ -295,11 +361,7 @@ _STATUS_PILL = {
     "cancelled": '<span class="img-status-pill pill-cancelled">CANCELLED</span>',
 }
 
-
-def _render_status_table(image_status: Dict[str, dict], order: list) -> str:
-    """Renders the per-image concurrent batch status as an HTML table.
-    `order` is the original upload order so rows don't jump around as
-    images finish out of sequence under concurrency."""
+def _render_status_table(image_status: Dict[str, dict], order: List[str]) -> str:
     rows = []
     for stem in order:
         st = image_status.get(stem)
@@ -309,11 +371,14 @@ def _render_status_table(image_status: Dict[str, dict], order: list) -> str:
         score = st.get("score")
         score_txt = f"{score}/10" if score is not None else "\u2014"
         rounds_txt = str(st.get("rounds_done", 0))
-        detail = st.get("detail", "")
+        detail = st.get("detail", "") or ""
+        name_esc = html.escape(st["name"])
+        detail_short = html.escape(detail[:120])
+        detail_attr = html.escape(detail)
         rows.append(
-            f'<tr><td>{st["name"]}</td><td>{pill}</td>'
+            f'<tr><td>{name_esc}</td><td>{pill}</td>'
             f'<td>{rounds_txt}</td><td>{score_txt}</td>'
-            f'<td style="color:#7d8590;font-size:0.7rem">{detail}</td></tr>'
+            f'<td style="color:#7d8590;font-size:0.7rem" title="{detail_attr}">{detail_short}</td></tr>'
         )
     body = "".join(rows) if rows else '<tr><td colspan="5" style="color:#7d8590">No images yet.</td></tr>'
     return f"""
@@ -322,8 +387,8 @@ def _render_status_table(image_status: Dict[str, dict], order: list) -> str:
     <span class="out-header-dot"></span><span class="out-header-title">Batch Status ({len(order)} images)</span>
   </div></div>
   <div style="max-height:260px; overflow-y:auto;">
-  <table style="width:100%; border-collapse:collapse; font-family:'JetBrains Mono',monospace; font-size:0.72rem;">
-    <thead><tr style="background:#161b22; color:#7d8590; text-align:left;">
+  <table class="batch-status-table" style="width:100%; border-collapse:collapse; font-family:'JetBrains Mono',monospace; font-size:0.72rem;">
+    <thead><tr style="background:#161b22; color:#7d8590; text-align:left; position:sticky; top:0; z-index:10;">
       <th style="padding:0.4rem 0.7rem;">Image</th><th style="padding:0.4rem 0.7rem;">Status</th>
       <th style="padding:0.4rem 0.7rem;">Rounds</th><th style="padding:0.4rem 0.7rem;">Score</th>
       <th style="padding:0.4rem 0.7rem;">Detail</th>
@@ -333,7 +398,6 @@ def _render_status_table(image_status: Dict[str, dict], order: list) -> str:
   </div>
 </div>"""
 
-
 def run_batch_detection_gui(image_files, categories_str, category_definitions,
                             local_server_port, use_external_api,
                             ext_api_url, ext_api_key, ext_model_name,
@@ -341,20 +405,18 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
                             detector_temp, judge_temp,
                             concurrency,
                             customize_prompts, detector_template, judge_template):
-    global BATCH_CACHE
     pipeline_cancel_event.clear()
 
-    # --- Validation ---
     if not image_files:
-        yield "Error: Please upload at least one image.", 0, None, "", gr.update(choices=[]), "", ""
+        yield "Error: Please upload at least one image.", _render_progress_bar(0), None, "", gr.update(choices=[]), "", ""
         return
 
     categories = [c.strip() for c in categories_str.split(",") if c.strip()]
     if not categories:
-        yield "Error: Please list at least one category.", 0, None, "", gr.update(choices=[]), "", ""
+        yield "Error: Please list at least one category.", _render_progress_bar(0), None, "", gr.update(choices=[]), "", ""
         return
 
-    image_paths: list[Path] = []
+    image_paths: List[Path] = []
     for f in image_files:
         if isinstance(f, str):
             image_paths.append(Path(f))
@@ -363,32 +425,40 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
         elif isinstance(f, dict) and "name" in f:
             image_paths.append(Path(f["name"]))
     if not image_paths:
-        yield "Error: Could not resolve uploaded files.", 0, None, "", gr.update(choices=[]), "", ""
+        yield "Error: Could not resolve uploaded files.", _render_progress_bar(0), None, "", gr.update(choices=[]), "", ""
         return
+
+    cleaned_paths: List[Path] = []
+    for p in image_paths:
+        try:
+            with Image.open(p) as im:
+                im.verify()
+            cleaned_paths.append(p)
+        except Exception as e:
+            yield f"Error: file '{p.name}' is not a valid image ({e}).", _render_progress_bar(0), None, "", gr.update(choices=[]), "", ""
+            return
+    image_paths = cleaned_paths
 
     concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
 
-    # --- Client setup ---
-    yield "Initializing API clients...", 2, None, "", gr.update(choices=[]), "", ""
+    yield "Initializing API clients...", _render_progress_bar(2, "Initializing..."), None, "", gr.update(choices=[]), "", ""
 
     if use_external_api:
         api_url, api_key, model_name = ext_api_url, ext_api_key, ext_model_name
+        if not api_key or api_key == "your-key":
+            yield ("Error: External API selected but no API key provided. "
+                   "Set one in the External API section."), _render_progress_bar(0, "Error"), 2, None, "", gr.update(choices=[]), "", ""
+            return
     else:
         with server_lock:
             if server_manager is None or not server_manager.is_healthy():
-                yield "Error: Local server not running. Start it on the Server tab or enable External API.", 2, None, "", gr.update(choices=[]), "", ""
+                yield "Error: Local server not running. Start it on the Server tab or enable External API.", _render_progress_bar(0, "Error"), None, "", gr.update(choices=[]), "", ""
                 return
             port = server_manager.port
             model_name = server_manager.model
         api_url = f"http://localhost:{port}/v1"
         api_key = "not-needed"
 
-    # httpx client with no timeout (per-request wait is unbounded — long
-    # detector/judge generations on a loaded local server shouldn't be cut
-    # off) and a connection pool sized to the requested concurrency so the
-    # pool itself isn't the bottleneck. The OpenAI Python SDK's sync client
-    # is documented as thread-safe, so one client instance can be shared
-    # across the worker pool below.
     try:
         http_client = httpx.Client(
             timeout=httpx.Timeout(None),
@@ -396,36 +466,34 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
         )
         client = OpenAI(base_url=api_url, api_key=api_key, http_client=http_client)
     except Exception as e:
-        yield f"Error initializing OpenAI client: {e}", 2, None, "", gr.update(choices=[]), "", ""
+        yield f"Error initializing OpenAI client: {e}", _render_progress_bar(0, "Error"), None, "", gr.update(choices=[]), "", ""
         return
 
-    # --- Logging capture ---
+    batch_id = str(int(time.time()))
+    batch_logger = logging.getLogger(f"detection_pipeline.batch_{batch_id}")
+    batch_logger.setLevel(logging.INFO)
+    batch_logger.propagate = False
+
     log_capture = io.StringIO()
     log_handler = logging.StreamHandler(log_capture)
     log_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
-    pipeline_logger = logging.getLogger("detection_pipeline")
-    pipeline_logger.addHandler(log_handler)
-    pipeline_logger.setLevel(logging.INFO)
+    batch_logger.addHandler(log_handler)
     log_lock = threading.Lock()
 
     det_tmpl = detector_template if customize_prompts else DEFAULT_DETECTOR_TEMPLATE
     jdg_tmpl = judge_template if customize_prompts else DEFAULT_JUDGE_TEMPLATE
 
-    batch_id = str(int(time.time()))
     run_dir = Path("./gui_runs") / f"run_{batch_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize memory cache for this batch
-    with BATCH_CACHE_LOCK:
-        BATCH_CACHE[batch_id] = {}
+    batch_results: Dict[str, Any] = {}
+    _cache_put(batch_id, batch_results)
+    results_lock = threading.Lock()
 
-    batch_results = BATCH_CACHE[batch_id]
-    results_lock = threading.Lock()  # guards batch_results dict mutation across worker threads
     q: queue.Queue = queue.Queue()
+    worker_done = threading.Event()
 
-    # Pre-assign unique stems up front (sequentially) so concurrent workers
-    # never race on duplicate-name resolution.
-    stem_order: list = []
+    stem_order: List[str] = []
     stem_for_path: Dict[Path, str] = {}
     for img_path in image_paths:
         img_stem = img_path.stem
@@ -464,10 +532,6 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
                     "rounds": [],
                 }
 
-            # Per-image progress callback — captures `stem` so round updates
-            # from concurrently-running images don't get attributed to the
-            # wrong image (the old single shared callback assumed only one
-            # image was ever in flight).
             def progress_callback(round_result: RoundResult, annotated_image: Image.Image, _stem=stem):
                 if pipeline_cancel_event.is_set():
                     raise PipelineCancelledException("Pipeline cancelled by user.")
@@ -482,6 +546,7 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
                 api_retries=3,
                 detector_temperature=detector_temp, detector_top_p=0.95,
                 judge_temperature=judge_temp,
+                logger=batch_logger,
             )
 
             best, _history = pipeline.run(
@@ -495,9 +560,6 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
 
             detections = best.get("detections") or []
             with results_lock:
-                # If the model produced no detections, fall back to the
-                # plain (un-annotated) original rather than showing an
-                # annotated image with nothing drawn on it.
                 batch_results[stem]["best_annotated"] = best.get("annotated") if detections else None
                 batch_results[stem]["detections"] = detections
             q.put(("finish_image", stem))
@@ -506,7 +568,7 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
             q.put(("image_cancelled", stem))
         except Exception as e:
             with log_lock:
-                pipeline_logger.error(f"[{stem}] {e}\n{traceback.format_exc()}")
+                batch_logger.error(f"[{stem}] {e}\n{traceback.format_exc()}")
             q.put(("image_error", stem, str(e)))
 
     def worker():
@@ -515,25 +577,24 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
                 with ThreadPoolExecutor(max_workers=concurrency) as pool:
                     futures = [pool.submit(process_one_image, p) for p in image_paths]
                     for fut in as_completed(futures):
-                        # Exceptions are already caught and reported inside
-                        # process_one_image per-image; this just lets us
-                        # detect a truly unexpected crash in the wrapper
-                        # itself without losing the rest of the batch.
                         exc = fut.exception()
                         if exc is not None:
                             with log_lock:
-                                pipeline_logger.error(f"Unhandled worker exception: {exc}")
+                                batch_logger.error(f"Unhandled worker exception: {exc}\n{traceback.format_exc()}")
+                            q.put(("image_error", "unknown", str(exc)))
 
             if pipeline_cancel_event.is_set():
                 q.put(("cancelled",))
             else:
-                zip_path = zip_results_folder(run_dir)
-                q.put(("done", str(zip_path)))
-
+                try:
+                    zip_path = zip_results_folder(run_dir)
+                    q.put(("done", str(zip_path)))
+                except Exception as e:
+                    q.put(("error", str(e), traceback.format_exc()))
         except Exception as e:
             q.put(("error", str(e), traceback.format_exc()))
         finally:
-            pipeline_logger.removeHandler(log_handler)
+            worker_done.set()
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -542,23 +603,29 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
         for img_path, stem in stem_for_path.items()
     }
 
-    yield (f"Starting batch ({total_imgs} images, {concurrency} concurrent)...", 5, None,
-           batch_id, gr.update(choices=[]), "", _render_status_table(image_status, stem_order))
+    # Initial yield
+    yield (f"Starting batch ({total_imgs} images, {concurrency} concurrent)...",
+           _render_progress_bar(5, "Starting batch..."),
+           None, batch_id, gr.update(choices=[]), "", _render_status_table(image_status, stem_order))
 
     finished_count = 0
     errored_count = 0
     last_active_stem = ""
+    last_yield_time = time.time()
 
     while True:
         try:
             msg = q.get(timeout=0.2)
             tag = msg[0]
+            status_msg = "Processing..."
+            is_terminal = False
 
             if tag == "start_image":
-                _img_name, stem = msg[1], msg[2]
+                stem = msg[2]
                 last_active_stem = stem
                 image_status[stem]["state"] = "running"
-                status_msg = f"Processing ({finished_count}/{total_imgs} done) \u2014 {sum(1 for s in image_status.values() if s['state']=='running')} running concurrently..."
+                running_n = sum(1 for s in image_status.values() if s['state'] == 'running')
+                status_msg = f"Processing ({finished_count}/{total_imgs} done) — {running_n} running concurrently..."
 
             elif tag == "round":
                 stem, r_res, r_img = msg[1], msg[2], msg[3]
@@ -584,94 +651,112 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
                 stem, err = msg[1], msg[2]
                 finished_count += 1
                 errored_count += 1
-                image_status[stem]["state"] = "error"
-                image_status[stem]["detail"] = err[:120]
+                if stem in image_status:
+                    image_status[stem]["state"] = "error"
+                    image_status[stem]["detail"] = err[:200]
                 status_msg = f"\u26a0 {stem} failed: {err[:160]}"
 
             elif tag == "image_cancelled":
                 stem = msg[1]
-                image_status[stem]["state"] = "cancelled"
+                if stem in image_status:
+                    image_status[stem]["state"] = "cancelled"
                 status_msg = f"{stem} cancelled."
 
             elif tag == "image_skipped":
                 stem = msg[1]
-                image_status[stem]["state"] = "cancelled"
-                status_msg = "Batch cancelled \u2014 skipping remaining queued images."
+                if stem in image_status:
+                    image_status[stem]["state"] = "cancelled"
+                status_msg = "Batch cancelled — skipping remaining queued images."
 
             elif tag == "done":
                 zip_path = msg[1]
                 summary = f"Batch complete: {finished_count - errored_count} succeeded, {errored_count} failed."
-                yield summary, 100, zip_path, batch_id, \
-                      gr.update(choices=stem_order), \
-                      log_capture.getvalue(), \
-                      _render_status_table(image_status, stem_order)
-                break
+                if not last_active_stem and stem_order:
+                    last_active_stem = stem_order[0]
+                yield (summary, _render_progress_bar(100, "Complete"), zip_path, batch_id,
+                       gr.update(choices=stem_order, value=last_active_stem or None),
+                       _tail(log_capture.getvalue()),
+                       _render_status_table(image_status, stem_order))
+                is_terminal = True
 
             elif tag == "cancelled":
-                yield "Pipeline execution cancelled by the user.", \
-                      100, None, batch_id, \
-                      gr.update(choices=stem_order), \
-                      log_capture.getvalue(), \
-                      _render_status_table(image_status, stem_order)
-                break
+                yield ("Pipeline execution cancelled by the user.", _render_progress_bar(100, "Cancelled"), None, batch_id,
+                       gr.update(choices=stem_order, value=last_active_stem or (stem_order[0] if stem_order else None)),
+                       _tail(log_capture.getvalue()),
+                       _render_status_table(image_status, stem_order))
+                is_terminal = True
 
             elif tag == "error":
                 err_msg, trace = msg[1], msg[2]
-                yield f"Pipeline execution failed:\n{err_msg}", \
-                      100, None, batch_id, \
-                      gr.update(choices=stem_order), \
-                      log_capture.getvalue() + f"\n[CRITICAL ERROR] {err_msg}\n{trace}", \
-                      _render_status_table(image_status, stem_order)
-                break
-            else:
-                status_msg = "Processing..."
+                yield (f"Pipeline execution failed:\n{err_msg}", _render_progress_bar(100, "Error"), None, batch_id,
+                       gr.update(choices=stem_order, value=last_active_stem or (stem_order[0] if stem_order else None)),
+                       _tail(log_capture.getvalue()) + f"\n[CRITICAL ERROR] {err_msg}\n{trace}",
+                       _render_status_table(image_status, stem_order))
+                is_terminal = True
 
-            done_n = sum(1 for s in image_status.values() if s["state"] in ("done", "error", "cancelled"))
-            pct = int((done_n / total_imgs) * 90) if total_imgs else 0
-            yield status_msg, pct, None, batch_id, \
-                  gr.update(choices=stem_order, value=last_active_stem or None), \
-                  log_capture.getvalue(), \
-                  _render_status_table(image_status, stem_order)
+            if is_terminal:
+                break
+
+            # Throttle non-terminal yields to ~3fps to prevent websocket overload
+            now = time.time()
+            if now - last_yield_time > 0.33:
+                done_n = sum(1 for s in image_status.values() if s["state"] in ("done", "error", "cancelled"))
+                pct = int((done_n / total_imgs) * 90) if total_imgs else 0
+                yield (status_msg,
+                       _render_progress_bar(pct, status_msg),
+                       None, batch_id,
+                       gr.update(choices=stem_order, value=last_active_stem or None),
+                       _tail(log_capture.getvalue()),
+                       _render_status_table(image_status, stem_order))
+                last_yield_time = now
 
         except queue.Empty:
-            if not threading.active_count() > 1:  # Simple check if worker died
+            if worker_done.is_set():
+                yield ("Pipeline ended unexpectedly (worker exited).", _render_progress_bar(100, "Aborted"), None, batch_id,
+                       gr.update(choices=stem_order, value=last_active_stem or (stem_order[0] if stem_order else None)),
+                       _tail(log_capture.getvalue()),
+                       _render_status_table(image_status, stem_order))
                 break
+
             done_n = sum(1 for s in image_status.values() if s["state"] in ("done", "error", "cancelled"))
             pct = int((done_n / total_imgs) * 90) if total_imgs else 0
             running_n = sum(1 for s in image_status.values() if s["state"] == "running")
-            yield (f"Processing... ({done_n}/{total_imgs} done, {running_n} running)",
-                   pct, None, batch_id,
-                   gr.update(choices=stem_order, value=last_active_stem or None),
-                   log_capture.getvalue(),
-                   _render_status_table(image_status, stem_order))
-            time.sleep(0.3)
 
+            now = time.time()
+            if now - last_yield_time > 0.33:
+                yield (f"Processing... ({done_n}/{total_imgs} done, {running_n} running)",
+                       _render_progress_bar(pct, "Processing..."),
+                       None, batch_id,
+                       gr.update(choices=stem_order, value=last_active_stem or None),
+                       _tail(log_capture.getvalue()),
+                       _render_status_table(image_status, stem_order))
+                last_yield_time = now
+
+            time.sleep(0.1) # Prevent CPU spin
+
+    batch_logger.removeHandler(log_handler)
+    log_handler.close()
 
 def cancel_pipeline():
     pipeline_cancel_event.set()
-    return "Cancellation requested. In-flight images will finish their current round; queued images will be skipped..."
-
+    return ("Cancellation requested. In-flight images will finish their current round "
+            "and write results; queued images will be skipped. "
+            "The Run button will re-enable once the worker drains.")
 
 # ---------------------------------------------------------------------------
 # Explorer Callbacks
 # ---------------------------------------------------------------------------
 
 def on_explorer_image_change(selected_image, batch_id):
-    with BATCH_CACHE_LOCK:
-        batch_results = BATCH_CACHE.get(batch_id, {})
-
+    batch_results = _cache_get(batch_id)
     if not batch_results or not selected_image or selected_image not in batch_results:
         return gr.update(choices=[], value=None)
-
     rounds = batch_results[selected_image].get("rounds", [])
     choices = ["Final Best"] + [str(r["round"]) for r in rounds]
     return gr.update(choices=choices, value="Final Best")
 
-
 def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid):
-    with BATCH_CACHE_LOCK:
-        batch_results = BATCH_CACHE.get(batch_id, {})
-
+    batch_results = _cache_get(batch_id)
     if not batch_results or not selected_image or selected_image not in batch_results:
         return None, None, '<span class="score-badge">Score: -/10</span>', "", "", "", "[]"
 
@@ -690,43 +775,50 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
                 best_raw = r["raw_text"]
                 best_err = r["parse_error"]
 
-        # No detections -> show the plain (unannotated) original instead of
-        # an "annotated" image with nothing drawn on it.
         display_img = best_annotated if best_detections else src_img
 
-        score_text = f'<span class="score-badge">Best Score: {best_score}/10 (Round {best_round_num})</span>' if best_score >= 0 else '<span class="score-badge">Score: -/10</span>'
+        if best_score >= 0:
+            score_text = f'<span class="score-badge">Best Score: {best_score}/10 (Round {best_round_num})</span>'
+        else:
+            score_text = '<span class="score-badge">Score: -/10</span>'
         return (src_img, display_img, score_text, best_feedback,
                 best_raw, best_err or "None",
-                json.dumps(img_data["detections"], indent=2))
-    else:
-        try:
-            round_idx = int(selected_round) - 1
-            rounds = img_data["rounds"]
-            if 0 <= round_idx < len(rounds):
-                r = rounds[round_idx]
-                round_detections = r.get("detections") or []
-                # Same fallback for an individual round: if this round's
-                # detector output had zero detections, show the plain
-                # original rather than an annotated image with no boxes.
-                display_img = r["image"] if round_detections else src_img
-                score_text = f'<span class="score-badge">Score: {r["score"]}/10</span>'
-                return (src_img, display_img, score_text,
-                        r["feedback"], r["raw_text"], r["parse_error"] or "None",
-                        json.dumps(r["detections"], indent=2))
-        except Exception as e:
-            print(f"Error loading round details: {e}")
+                json.dumps(img_data["detections"], indent=2) if img_data["detections"] else "[]")
+
+    try:
+        round_idx = int(selected_round) - 1
+        rounds = img_data["rounds"]
+        if 0 <= round_idx < len(rounds):
+            r = rounds[round_idx]
+            round_detections = r.get("detections") or []
+            display_img = r["image"] if round_detections else src_img
+            score_text = f'<span class="score-badge">Score: {r["score"]}/10</span>'
+            return (src_img, display_img, score_text,
+                    r["feedback"], r["raw_text"], r["parse_error"] or "None",
+                    json.dumps(r["detections"], indent=2) if r["detections"] else "[]")
+    except Exception as e:
+        print(f"Error loading round details: {e}")
 
     return src_img, None, '<span class="score-badge">Score: -/10</span>', "", "", "", "[]"
-
 
 # ---------------------------------------------------------------------------
 # UI Toggle Helpers
 # ---------------------------------------------------------------------------
 
 def toggle_run_btn(is_running):
-    """Toggles button interactivity based on pipeline state."""
     return gr.update(interactive=not is_running), gr.update(interactive=is_running)
 
+def toggle_external_api(use_external):
+    return (
+        gr.update(interactive=not use_external),
+        gr.update(interactive=not use_external),
+        gr.update(interactive=not use_external),
+        gr.update(interactive=not use_external),
+        gr.update(interactive=not use_external),
+        gr.update(interactive=not use_external),
+        gr.update(interactive=not use_external),
+        gr.update(visible=use_external),
+    )
 
 # ---------------------------------------------------------------------------
 # Gradio Layout
@@ -736,7 +828,6 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(theme=theme, css=custom_css, title="LLM Object Detection Console") as app:
         gr.HTML(CONSOLE_JS)
 
-        # --- Header ---
         gr.HTML("""
         <div class="app-header" style="display:flex; align-items:center; justify-content:space-between;">
             <div>
@@ -761,18 +852,23 @@ def build_app() -> gr.Blocks:
                             label="Recommended Model Presets",
                             choices=MODEL_PRESETS,
                             value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
+                            interactive=True,
                         )
                         server_model_input = gr.Textbox(
                             label="Model GGUF Path or HF Repo ID",
-                            value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_X",
+                            value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
                             placeholder="e.g. C:/models/qwen.gguf or HF ID",
+                            interactive=True,
                         )
                         server_preset.change(handle_preset_change, server_preset, server_model_input)
 
-                        server_port_input = gr.Number(label="Port Number", value=8080, precision=0)
+                        server_port_input = gr.Number(label="Port Number", value=8080, precision=0,
+                                                       interactive=True)
                         with gr.Row():
-                            server_thinking_chk = gr.Checkbox(label="Thinking Mode", value=False)
-                            server_mtp_chk = gr.Checkbox(label="MTP Speculative Drafting", value=True)
+                            server_thinking_chk = gr.Checkbox(label="Thinking Mode", value=False,
+                                                              interactive=True)
+                            server_mtp_chk = gr.Checkbox(label="MTP Speculative Drafting", value=True,
+                                                         interactive=True)
 
                         with gr.Accordion("Advanced Server Parameters", open=False):
                             server_host_input = gr.Textbox(label="Host Binding", value="0.0.0.0")
@@ -787,6 +883,7 @@ def build_app() -> gr.Blocks:
                         with gr.Row():
                             start_server_btn = gr.Button("\u25b6  Start Server", variant="primary")
                             stop_server_btn = gr.Button("\u23f9  Stop Server", variant="secondary", size="sm")
+                            refresh_logs_btn = gr.Button("\U0001F504 Refresh Logs", variant="secondary", size="sm")
 
                     with gr.Column(scale=3):
                         gr.HTML('<p class="section-label">Server Output Console</p>')
@@ -813,13 +910,14 @@ def build_app() -> gr.Blocks:
                     stop_server_wrapper,
                     outputs=[server_logs_viewer, server_status_badge],
                 )
-                app.load(get_server_status_and_logs,
-                         outputs=[server_logs_viewer, server_status_badge])
+                refresh_logs_btn.click(
+                    get_server_status_and_logs,
+                    outputs=[server_logs_viewer, server_status_badge],
+                )
 
             # ============ TAB 2: BATCH SANDBOX ============
             with gr.TabItem("\U0001F9EA Batch Sandbox"):
                 with gr.Row(equal_height=False):
-                    # Left column — config
                     with gr.Column(scale=2, min_width=400):
                         gr.HTML('<p class="section-label">Configuration</p>')
 
@@ -846,7 +944,7 @@ def build_app() -> gr.Blocks:
                         )
 
                         with gr.Accordion("Pipeline Parameters", open=False):
-                            rounds_slider = gr.Slider(label="Optimiztion Max Rounds",
+                            rounds_slider = gr.Slider(label="Optimization Max Rounds",
                                                       minimum=1, maximum=5, step=1, value=1)
                             score_threshold_slider = gr.Slider(
                                 label="Stop Score Threshold (0-10)",
@@ -858,19 +956,24 @@ def build_app() -> gr.Blocks:
                                 label="Judge Temperature",
                                 minimum=0.0, maximum=1.5, step=0.05, value=0.2)
 
-                        with gr.Accordion("External API (Optional)", open=False):
+                        with gr.Accordion("External API (Optional)", open=False) as ext_api_group:
                             use_external_api_chk = gr.Checkbox(
                                 label="Use External API instead of Local Server",
                                 value=False)
                             ext_api_url = gr.Textbox(label="Base URL", value="https://api.openai.com/v1")
-                            ext_api_key = gr.Textbox(label="API Key", value="your-key", type="password")
+                            ext_api_key = gr.Textbox(label="API Key",
+                                                     placeholder="sk-...",
+                                                     value="", type="password")
                             ext_model_name = gr.Textbox(label="Model Name", value="gpt-4o")
 
                         with gr.Accordion("Advanced Settings", open=False):
                             concurrency_slider = gr.Slider(
                                 label="Concurrent Images",
-                                info="Images processed in parallel via httpx. Requests use an "
-                                     "unlimited timeout, so a slow generation won't get cut off.",
+                                info=("Images processed in parallel via httpx. With a local "
+                                      "llama-server running parallel_slots=1, only one request "
+                                      "is served at a time — high values just queue at the "
+                                      "server. Set higher (8–32) only when targeting an "
+                                      "external API or a multi-slot local server."),
                                 minimum=1, maximum=64, step=1, value=DEFAULT_CONCURRENCY,
                             )
 
@@ -878,17 +981,13 @@ def build_app() -> gr.Blocks:
                             run_btn = gr.Button("\u25b6  Run Batch Pipeline", variant="primary", interactive=True)
                             stop_run_btn = gr.Button("\u23f9  Cancel", variant="secondary", size="sm", interactive=False)
 
-                    # Right column — results
                     with gr.Column(scale=3, min_width=600):
                         gr.HTML('<p class="section-label">Results</p>')
 
                         with gr.Group():
                             pipeline_status = gr.Markdown("**Status: Idle**")
-                            progress_slider = gr.Slider(
-                                label="Execution Progress",
-                                minimum=0, maximum=100, step=1, value=0,
-                                interactive=False,
-                            )
+                            progress_html = gr.HTML(value=_render_progress_bar(0, "Idle"))
+                            
                         batch_status_table = gr.HTML(
                             value=_render_status_table({}, []),
                         )
@@ -936,6 +1035,7 @@ def build_app() -> gr.Blocks:
                                     detections_json_box = gr.Code(
                                         language="json",
                                         show_label=False,
+                                        value="[]",
                                     )
                                 gr.HTML('</div>')
 
@@ -977,17 +1077,32 @@ def build_app() -> gr.Blocks:
                 )
 
         # -------------------------------------------------------------------
-        # Event Bindings (Moved to bottom to ensure all variables are in scope)
+        # Cross-component wiring
         # -------------------------------------------------------------------
 
-        # 1. Disable Run button, Enable Stop button immediately on click
+        use_external_api_chk.change(
+            toggle_external_api,
+            inputs=[use_external_api_chk],
+            outputs=[start_server_btn, stop_server_btn,
+                     server_preset, server_model_input, server_port_input,
+                     server_thinking_chk, server_mtp_chk,
+                     ext_api_group],
+        )
+
+        status_timer = gr.Timer(value=5.0)
+        app.load(get_server_status_and_logs,
+                 outputs=[server_logs_viewer, server_status_badge])
+        status_timer.tick(
+            get_server_status_and_logs,
+            outputs=[server_logs_viewer, server_status_badge],
+        )
+
         run_btn.click(
             fn=lambda: toggle_run_btn(is_running=True),
             inputs=None,
             outputs=[run_btn, stop_run_btn],
-            queue=False
+            queue=False,
         ).then(
-            # 2. Execute the actual pipeline
             fn=run_batch_detection_gui,
             inputs=[
                 input_images, categories_input, category_defs_input,
@@ -999,40 +1114,25 @@ def build_app() -> gr.Blocks:
                 customize_prompts_chk, custom_det_prompt, custom_jdg_prompt,
             ],
             outputs=[
-                pipeline_status, progress_slider,
+                pipeline_status, progress_html,
                 download_results_box, batch_id_state,
                 explorer_image_select, pipeline_logs_viewer,
                 batch_status_table,
             ],
-            concurrency_limit=1  # Prevent overlapping batch runs
+            concurrency_limit=1,
         ).then(
-            # 3. Re-enable Run, Disable Stop when pipeline finishes/errors
             fn=lambda: toggle_run_btn(is_running=False),
             inputs=None,
             outputs=[run_btn, stop_run_btn],
-            queue=False
+            queue=False,
         )
 
-        # Cancel button
         stop_run_btn.click(
             fn=cancel_pipeline,
             outputs=[pipeline_status],
-            queue=False
+            queue=False,
         )
 
-        # Explorer Events
-        # Selecting a new image must do two things: repopulate the Round
-        # dropdown's choices (on_explorer_image_change), AND refresh the
-        # displayed image/score/feedback panels for that new selection
-        # (on_explorer_round_change). These used to be wired as two
-        # independent .change() listeners, relying on the Round dropdown's
-        # own .change() firing after its value was set programmatically —
-        # Gradio does not reliably re-trigger a component's .change() event
-        # from a value update issued by another component's callback, so
-        # picking a new image updated the round list but left the old
-        # image/results on screen. Chaining with .then() guarantees the
-        # refresh runs immediately after the round list is repopulated,
-        # using that same new value.
         explorer_image_select.change(
             on_explorer_image_change,
             inputs=[explorer_image_select, batch_id_state],
