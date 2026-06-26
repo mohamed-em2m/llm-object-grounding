@@ -411,7 +411,12 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
                             prep_white_balance, prep_grid_style,
                             prep_som_enabled, prep_tiling_enabled,
                             prep_tile_size, prep_tile_overlap,
-                            prep_crop_verify_enabled, prep_crop_padding):
+                            prep_crop_verify_enabled, prep_crop_padding,
+                            prep_grid_step, prep_grid_line_width, prep_grid_font_size,
+                            prep_grid_line_color, prep_grid_line_color_custom,
+                            prep_grid_text_color, prep_grid_text_color_custom,
+                            prep_grid_backing_color, prep_grid_backing_color_custom,
+                            prep_send_pixel_bounds, prep_min_pixels, prep_max_pixels):
     pipeline_cancel_event.clear()
 
     if not image_files:
@@ -503,6 +508,15 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
             "tiling_enabled": False,
             "crop_verify_enabled": False,
             "grid_style": "standard",
+            "grid_step": 100,
+            "grid_line_width": 1,
+            "grid_font_size": 0,
+            "grid_line_color": "red",
+            "grid_text_color": "white",
+            "grid_backing_color": "black",
+            "send_pixel_bounds": False,
+            "min_pixels": 200704,
+            "max_pixels": 4194304,
         }
     else:
         prep_config = {
@@ -522,6 +536,19 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
             "tile_overlap": float(prep_tile_overlap) / 100.0,
             "crop_verify_enabled": prep_crop_verify_enabled,
             "crop_padding": float(prep_crop_padding) / 100.0,
+            
+            # Custom grid options
+            "grid_step": int(prep_grid_step),
+            "grid_line_width": int(prep_grid_line_width),
+            "grid_font_size": int(prep_grid_font_size),
+            "grid_line_color": prep_grid_line_color if prep_grid_line_color != "custom" else prep_grid_line_color_custom,
+            "grid_text_color": prep_grid_text_color if prep_grid_text_color != "custom" else prep_grid_text_color_custom,
+            "grid_backing_color": prep_grid_backing_color if prep_grid_backing_color != "custom" else prep_grid_backing_color_custom,
+            
+            # Custom pixel bounds
+            "send_pixel_bounds": prep_send_pixel_bounds,
+            "min_pixels": int(prep_min_pixels) if prep_min_pixels is not None else None,
+            "max_pixels": int(prep_max_pixels) if prep_max_pixels is not None else None,
         }
 
     batch_results: Dict[str, Any] = {}
@@ -563,7 +590,16 @@ def run_batch_detection_gui(image_files, categories_str, category_definitions,
 
             with results_lock:
                 batch_results[stem] = {
-                    "grid_original": draw_grid(base_image),
+                    "grid_original": draw_grid(
+                        base_image,
+                        step=prep_config.get("grid_step", 100),
+                        style=prep_config.get("grid_style", "standard"),
+                        line_color=prep_config.get("grid_line_color", "red"),
+                        line_width=prep_config.get("grid_line_width", 1),
+                        font_size=prep_config.get("grid_font_size", 0),
+                        text_color=prep_config.get("grid_text_color", "white"),
+                        backing_color=prep_config.get("grid_backing_color", "black"),
+                    ),
                     "raw_original": base_image,
                     "best_annotated": None,
                     "detections": [],
@@ -1047,6 +1083,53 @@ def build_app() -> gr.Blocks:
                                     value="Standard Red",
                                     info="Select standard, semi-transparent, fine 10x10 grid, or disable grid overlay."
                                 )
+                                prep_grid_step_slider = gr.Slider(
+                                    label="Grid Step Size (0-1000 scale)",
+                                    minimum=20, maximum=500, step=10, value=100,
+                                    info="Distance between grid lines. 100 step divides image into 10 sections."
+                                )
+                                prep_grid_line_width_slider = gr.Slider(
+                                    label="Grid Line Thickness (px)",
+                                    minimum=1, maximum=10, step=1, value=1
+                                )
+                                prep_grid_font_size_slider = gr.Slider(
+                                    label="Grid Label Font Size (0 = Auto)",
+                                    minimum=0, maximum=48, step=1, value=0
+                                )
+                                with gr.Row():
+                                    prep_grid_line_color_dropdown = gr.Dropdown(
+                                        label="Grid Line Color",
+                                        choices=["red", "blue", "green", "white", "black", "yellow", "cyan", "magenta", "custom"],
+                                        value="red"
+                                    )
+                                    prep_grid_line_color_custom = gr.Textbox(
+                                        label="Custom Line Color (Hex/Name)",
+                                        value="red",
+                                        visible=False
+                                    )
+                                with gr.Row():
+                                    prep_grid_text_color_dropdown = gr.Dropdown(
+                                        label="Grid Text Color",
+                                        choices=["white", "black", "red", "blue", "green", "yellow", "cyan", "magenta", "custom"],
+                                        value="white"
+                                    )
+                                    prep_grid_text_color_custom = gr.Textbox(
+                                        label="Custom Text Color (Hex/Name)",
+                                        value="white",
+                                        visible=False
+                                    )
+                                with gr.Row():
+                                    prep_grid_backing_color_dropdown = gr.Dropdown(
+                                        label="Grid Text Backing Color",
+                                        choices=["black", "none", "white", "red", "blue", "green", "custom"],
+                                        value="black"
+                                    )
+                                    prep_grid_backing_color_custom = gr.Textbox(
+                                        label="Custom Backing (Hex/Name)",
+                                        value="black",
+                                        visible=False
+                                    )
+                                
                                 prep_som_chk = gr.Checkbox(
                                     label="Enable Set-of-Mark (SoM) Prompting",
                                     value=False,
@@ -1078,6 +1161,26 @@ def build_app() -> gr.Blocks:
                                     label="Crop Context Padding (%)",
                                     minimum=0, maximum=50, step=5, value=15
                                 )
+                                
+                                gr.HTML("<div style='font-weight:bold;margin-top:8px;'>VLM Processor Pixel Bounds (e.g. Qwen-VL)</div>")
+                                prep_send_pixel_bounds_chk = gr.Checkbox(
+                                    label="Send Pixel Bounds in API Request",
+                                    value=False,
+                                    info="Pass min_pixels/max_pixels in the extra_body of API calls (supported by vLLM/Qwen-VL backends)."
+                                )
+                                with gr.Row(visible=False) as prep_pixel_bounds_row:
+                                    prep_min_pixels_num = gr.Number(
+                                        label="min_pixels",
+                                        value=200704,
+                                        precision=0,
+                                        info="Default: 256 * 28 * 28"
+                                    )
+                                    prep_max_pixels_num = gr.Number(
+                                        label="max_pixels",
+                                        value=4194304,
+                                        precision=0,
+                                        info="Default: 2048 * 2048"
+                                    )
 
                         with gr.Accordion("External API (Optional)", open=False) as ext_api_group:
                             use_external_api_chk = gr.Checkbox(
@@ -1218,6 +1321,33 @@ def build_app() -> gr.Blocks:
                      ext_api_group],
         )
 
+        # Toggle custom color fields visibility based on dropdown selection
+        def toggle_custom_color_field(choice):
+            return gr.update(visible=(choice == "custom"))
+
+        prep_grid_line_color_dropdown.change(
+            toggle_custom_color_field,
+            inputs=[prep_grid_line_color_dropdown],
+            outputs=[prep_grid_line_color_custom]
+        )
+        prep_grid_text_color_dropdown.change(
+            toggle_custom_color_field,
+            inputs=[prep_grid_text_color_dropdown],
+            outputs=[prep_grid_text_color_custom]
+        )
+        prep_grid_backing_color_dropdown.change(
+            toggle_custom_color_field,
+            inputs=[prep_grid_backing_color_dropdown],
+            outputs=[prep_grid_backing_color_custom]
+        )
+
+        # Toggle VLM pixel bounds inputs visibility
+        prep_send_pixel_bounds_chk.change(
+            lambda v: gr.update(visible=v),
+            inputs=[prep_send_pixel_bounds_chk],
+            outputs=[prep_pixel_bounds_row]
+        )
+
         status_timer = gr.Timer(value=5.0)
         app.load(get_server_status_and_logs,
                  outputs=[server_logs_viewer, server_status_badge])
@@ -1248,6 +1378,13 @@ def build_app() -> gr.Blocks:
                 prep_som_chk, prep_tiling_chk,
                 prep_tile_size_slider, prep_tile_overlap_slider,
                 prep_cv_chk, prep_cv_padding_slider,
+                # Custom grid inputs
+                prep_grid_step_slider, prep_grid_line_width_slider, prep_grid_font_size_slider,
+                prep_grid_line_color_dropdown, prep_grid_line_color_custom,
+                prep_grid_text_color_dropdown, prep_grid_text_color_custom,
+                prep_grid_backing_color_dropdown, prep_grid_backing_color_custom,
+                # VLM Processor bounds inputs
+                prep_send_pixel_bounds_chk, prep_min_pixels_num, prep_max_pixels_num
             ],
             outputs=[
                 pipeline_status, progress_html,

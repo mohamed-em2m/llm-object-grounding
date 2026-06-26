@@ -152,6 +152,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prep-tile-overlap", type=float, default=0.2, help="Overlap ratio between tiles (0.0 to 0.5).")
     p.add_argument("--prep-crop-verify-enabled", action="store_true", help="Enable multi-pass Crop & Verify validation pipeline.")
     p.add_argument("--prep-crop-padding", type=float, default=0.15, help="Context padding ratio for cropped patches.")
+    
+    # Custom Grid overlays and VLM processor parameters
+    p.add_argument("--prep-grid-step", type=int, default=100, help="Grid line separation (0-1000 scale).")
+    p.add_argument("--prep-grid-line-width", type=int, default=1, help="Grid line thickness in pixels.")
+    p.add_argument("--prep-grid-font-size", type=int, default=0, help="Grid text label font size (0 for auto).")
+    p.add_argument("--prep-grid-line-color", type=str, default="red", help="Grid line color (Hex or CSS name).")
+    p.add_argument("--prep-grid-text-color", type=str, default="white", help="Grid text label color (Hex or CSS name).")
+    p.add_argument("--prep-grid-backing-color", type=str, default="black", help="Grid text label backing color (Hex or CSS name or 'none').")
+    
+    p.add_argument("--prep-send-pixel-bounds", action="store_true", help="Send min_pixels and max_pixels in API request.")
+    p.add_argument("--prep-min-pixels", type=int, default=200704, help="VLM min_pixels parameter.")
+    p.add_argument("--prep-max-pixels", type=int, default=4194304, help="VLM max_pixels parameter.")
 
     # --- Output ---
     p.add_argument(
@@ -198,6 +210,15 @@ def main():
             "tiling_enabled": False,
             "crop_verify_enabled": False,
             "grid_style": args.prep_grid_style,
+            "grid_step": args.prep_grid_step,
+            "grid_line_width": args.prep_grid_line_width,
+            "grid_font_size": args.prep_grid_font_size,
+            "grid_line_color": args.prep_grid_line_color,
+            "grid_text_color": args.prep_grid_text_color,
+            "grid_backing_color": args.prep_grid_backing_color,
+            "send_pixel_bounds": args.prep_send_pixel_bounds,
+            "min_pixels": args.prep_min_pixels,
+            "max_pixels": args.prep_max_pixels,
         }
     else:
         prep_config = {
@@ -217,6 +238,19 @@ def main():
             "tile_overlap": args.prep_tile_overlap,
             "crop_verify_enabled": args.prep_crop_verify_enabled,
             "crop_padding": args.prep_crop_padding,
+            
+            # Custom grid layout parameters
+            "grid_step": args.prep_grid_step,
+            "grid_line_width": args.prep_grid_line_width,
+            "grid_font_size": args.prep_grid_font_size,
+            "grid_line_color": args.prep_grid_line_color,
+            "grid_text_color": args.prep_grid_text_color,
+            "grid_backing_color": args.prep_grid_backing_color,
+            
+            # VLM Processor bounds parameters
+            "send_pixel_bounds": args.prep_send_pixel_bounds,
+            "min_pixels": args.prep_min_pixels,
+            "max_pixels": args.prep_max_pixels,
         }
 
     # Build pipeline

@@ -189,9 +189,27 @@ def _text_with_backing(draw: ImageDraw.ImageDraw, xy, text, font, fill, backing=
     draw.text((x, y), text, fill=fill, font=font)
 
 
-def draw_grid(image: Image.Image, step: int = 100) -> Image.Image:
-    """Overlay a 0-1000 scale coordinate grid with readable axis labels."""
-    return draw_premium_grid(image, style="standard", step=step)
+def draw_grid(
+    image: Image.Image,
+    step: int = 100,
+    style: str = "standard",
+    line_color: str = "red",
+    line_width: int = 1,
+    font_size: int = 0,
+    text_color: str = "white",
+    backing_color: str = "black"
+) -> Image.Image:
+    """Overlay a 0-1000 scale coordinate grid with readable axis labels and custom colors/sizes."""
+    return draw_premium_grid(
+        image,
+        style=style,
+        step=step,
+        line_color=line_color,
+        line_width=line_width,
+        font_size=font_size,
+        text_color=text_color,
+        backing_color=backing_color
+    )
 
 
 def render_detections(base_image: Image.Image, detections: list[dict]) -> Image.Image:
@@ -476,6 +494,17 @@ attempt that the reviewer did not flag as wrong.
     def run_inference(self, image_uri, categories, category_definitions, feedback=None, som_proposals=None) -> str:
         prompt = self.get_detector_prompt(categories, category_definitions, feedback, som_proposals)
 
+        # Prepare extra parameters (e.g. min_pixels, max_pixels) for Qwen-VL or vLLM backends if enabled
+        extra_args = {}
+        if self.preprocessing_config.get("send_pixel_bounds"):
+            extra_body = {}
+            if self.preprocessing_config.get("min_pixels") is not None:
+                extra_body["min_pixels"] = int(self.preprocessing_config["min_pixels"])
+            if self.preprocessing_config.get("max_pixels") is not None:
+                extra_body["max_pixels"] = int(self.preprocessing_config["max_pixels"])
+            if extra_body:
+                extra_args["extra_body"] = extra_body
+
         def _do_call():
             return self.detector_client.chat.completions.create(
                 model=self.detector_model,
@@ -491,6 +520,7 @@ attempt that the reviewer did not flag as wrong.
                         ],
                     }
                 ],
+                **extra_args
             )
 
         response = _call_with_retries(_do_call, retries=self.api_retries, what="Detector call")
@@ -503,6 +533,17 @@ attempt that the reviewer did not flag as wrong.
         """
         crop_uri = pil_to_data_uri(crop_image)
         prompt = f"Analyze this image crop carefully. Is there a visible '{label}' present inside this crop? You must respond in exactly this format, with nothing else: <present>YES</present> or <present>NO</present>."
+
+        # Prepare extra parameters if enabled
+        extra_args = {}
+        if self.preprocessing_config.get("send_pixel_bounds"):
+            extra_body = {}
+            if self.preprocessing_config.get("min_pixels") is not None:
+                extra_body["min_pixels"] = int(self.preprocessing_config["min_pixels"])
+            if self.preprocessing_config.get("max_pixels") is not None:
+                extra_body["max_pixels"] = int(self.preprocessing_config["max_pixels"])
+            if extra_body:
+                extra_args["extra_body"] = extra_body
 
         def _do_call():
             return self.detector_client.chat.completions.create(
@@ -518,6 +559,7 @@ attempt that the reviewer did not flag as wrong.
                         ],
                     }
                 ],
+                **extra_args
             )
 
         try:
@@ -646,8 +688,14 @@ def _filter_and_translate_feedback_for_tile(feedback: str, tile_x: int, tile_y: 
             sharpen=self.preprocessing_config.get("sharpen", False)
         )
 
-        # 5. Determine grid overlay style
+        # 5. Determine grid overlay style and properties
         grid_style = self.preprocessing_config.get("grid_style", "standard")
+        grid_step = self.preprocessing_config.get("grid_step", 100)
+        grid_line_color = self.preprocessing_config.get("grid_line_color", "red")
+        grid_line_width = self.preprocessing_config.get("grid_line_width", 1)
+        grid_font_size = self.preprocessing_config.get("grid_font_size", 0)
+        grid_text_color = self.preprocessing_config.get("grid_text_color", "white")
+        grid_backing_color = self.preprocessing_config.get("grid_backing_color", "black")
 
         feedback = None
         history: list[RoundResult] = []
@@ -681,7 +729,16 @@ def _filter_and_translate_feedback_for_tile(feedback: str, tile_x: int, tile_y: 
                         orig_h=prep_h
                     ) if feedback else None
 
-                    tile_img_with_grid = draw_premium_grid(tile["tile_image"], style=grid_style)
+                    tile_img_with_grid = draw_premium_grid(
+                        tile["tile_image"],
+                        style=grid_style,
+                        step=grid_step,
+                        line_color=grid_line_color,
+                        line_width=grid_line_width,
+                        font_size=grid_font_size,
+                        text_color=grid_text_color,
+                        backing_color=grid_backing_color
+                    )
                     tile_uri = pil_to_data_uri(tile_img_with_grid)
 
                     logger.info("Running detection on Tile %d/%d (at x=%d, y=%d)...", idx, len(tiles), tile["tile_x"], tile["tile_y"])
@@ -719,7 +776,16 @@ def _filter_and_translate_feedback_for_tile(feedback: str, tile_x: int, tile_y: 
             else:
                 # Full-image processing path
                 # Overlay Grid
-                grid_img = draw_premium_grid(preprocessed_image, style=grid_style)
+                grid_img = draw_premium_grid(
+                    preprocessed_image,
+                    style=grid_style,
+                    step=grid_step,
+                    line_color=grid_line_color,
+                    line_width=grid_line_width,
+                    font_size=grid_font_size,
+                    text_color=grid_text_color,
+                    backing_color=grid_backing_color
+                )
                 
                 # Overlay Set-of-Mark proposals if enabled
                 som_proposals = None
@@ -798,11 +864,29 @@ def _filter_and_translate_feedback_for_tile(feedback: str, tile_x: int, tile_y: 
             
             # Draw preprocessed annotated view with grid for the judge
             annotated_prep = render_detections(preprocessed_image, detections_prep)
-            annotated_prep_with_grid = draw_premium_grid(annotated_prep, style=grid_style)
+            annotated_prep_with_grid = draw_premium_grid(
+                annotated_prep,
+                style=grid_style,
+                step=grid_step,
+                line_color=grid_line_color,
+                line_width=grid_line_width,
+                font_size=grid_font_size,
+                text_color=grid_text_color,
+                backing_color=grid_backing_color
+            )
             annotated_prep_uri = pil_to_data_uri(annotated_prep_with_grid)
             
             # Setup original scale background with grid for the judge
-            grid_original_prep = draw_premium_grid(preprocessed_image, style=grid_style)
+            grid_original_prep = draw_premium_grid(
+                preprocessed_image,
+                style=grid_style,
+                step=grid_step,
+                line_color=grid_line_color,
+                line_width=grid_line_width,
+                font_size=grid_font_size,
+                text_color=grid_text_color,
+                backing_color=grid_backing_color
+            )
             grid_original_prep_uri = pil_to_data_uri(grid_original_prep)
 
             score, judge_feedback = self.judge_detections(

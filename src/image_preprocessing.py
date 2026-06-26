@@ -14,7 +14,7 @@ import math
 import numpy as np
 import cv2
 import logging
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageColor
 from typing import Tuple, Dict, Any, List
 
 logger = logging.getLogger("detection_pipeline.preprocessing")
@@ -222,12 +222,38 @@ def preprocess_color_space(image: Image.Image, white_balance: bool = False) -> I
 # Coordinate Overlays (Advanced Grid & Set-of-Mark)
 # ---------------------------------------------------------------------------
 
-def draw_premium_grid(image: Image.Image, style: str = "standard", step: int = 100) -> Image.Image:
+def parse_color(color_val: Any, default_rgb: tuple[int, int, int], alpha: int = 255) -> tuple[int, int, int, int]:
+    """Parse color parameter into a 4-tuple (R, G, B, A). Support strings (e.g. hex, name) and tuple types."""
+    if not color_val or str(color_val).lower() == "none":
+        return (0, 0, 0, 0)
+    if isinstance(color_val, tuple):
+        if len(color_val) == 3:
+            return (color_val[0], color_val[1], color_val[2], alpha)
+        elif len(color_val) == 4:
+            return color_val
+        return (default_rgb[0], default_rgb[1], default_rgb[2], alpha)
+    
+    try:
+        rgb = ImageColor.getrgb(str(color_val))
+        return (rgb[0], rgb[1], rgb[2], alpha)
+    except Exception:
+        return (default_rgb[0], default_rgb[1], default_rgb[2], alpha)
+
+def draw_premium_grid(
+    image: Image.Image,
+    style: str = "standard",
+    step: int = 100,
+    line_color: str | tuple = "red",
+    line_width: int = 1,
+    font_size: int = 0,
+    text_color: str | tuple = "white",
+    backing_color: str | tuple = "black"
+) -> Image.Image:
     """
-    Overlay a premium grid. Supports:
-      - 'standard': solid red line grid.
-      - 'transparent': semi-transparent blended red grid.
-      - 'fine': 10x10 gray coordinate grid (step=100) with thin lines.
+    Overlay a custom grid. Supports:
+      - 'standard': solid line grid.
+      - 'transparent': semi-transparent blended grid.
+      - 'fine': coordinate grid with thin lines.
       - 'none': no grid overlay.
     """
     if style == "none":
@@ -235,76 +261,82 @@ def draw_premium_grid(image: Image.Image, style: str = "standard", step: int = 1
         
     img = image.copy()
     w, h = img.size
-    font = _load_font(max(10, min(w, h) // 70))
     
-    if style == "transparent":
+    # Font sizing
+    actual_font_size = font_size if font_size > 0 else max(10, min(w, h) // 70)
+    font = _load_font(actual_font_size)
+    
+    # Parse styling configurations
+    # Default fallback RGB values depend on style
+    if style == "fine":
+        default_line_rgb = (180, 180, 180)
+        default_text_rgb = (255, 255, 255)
+        default_bg_rgb = (70, 70, 70)
+        line_alpha = 80
+        bg_alpha = 180
+    elif style == "transparent":
+        default_line_rgb = (255, 0, 0)
+        default_text_rgb = (255, 255, 255)
+        default_bg_rgb = (255, 0, 0)
+        line_alpha = 100
+        bg_alpha = 160
+    else:  # standard
+        default_line_rgb = (255, 0, 0)
+        # For standard solid grid, default text color matches line color
+        default_text_rgb = default_line_rgb
+        default_bg_rgb = (0, 0, 0)
+        line_alpha = 255
+        bg_alpha = 255
+        # If user explicitly passed line color but kept default text_color, align them
+        if line_color != "red" and text_color == "white" and style == "standard":
+            text_color = line_color
+
+    parsed_line_color = parse_color(line_color, default_line_rgb, line_alpha)
+    parsed_text_color = parse_color(text_color, default_text_rgb, 255)
+    parsed_bg_color = parse_color(backing_color, default_bg_rgb, bg_alpha) if backing_color != "none" else None
+
+    if style in ("transparent", "fine"):
         # Draw on transparent overlay
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         draw_overlay = ImageDraw.Draw(overlay)
         
-        # Grid lines color: semi-transparent red (255, 0, 0, 100)
-        grid_color = (255, 0, 0, 100)
-        text_color = (255, 255, 255, 255)
-        bg_color = (255, 0, 0, 160)
-        
         for i in range(0, 1001, step):
             x = i * w / 1000
-            draw_overlay.line([(x, 0), (x, h)], fill=grid_color, width=1)
+            draw_overlay.line([(x, 0), (x, h)], fill=parsed_line_color, width=line_width)
             # Text label
-            _text_with_backing(draw_overlay, (x + 2, 2), str(i), font, text_color, bg_color)
+            _text_with_backing(draw_overlay, (x + 2, 2), str(i), font, parsed_text_color, parsed_bg_color)
             
         for i in range(0, 1001, step):
             y = i * h / 1000
-            draw_overlay.line([(0, y), (w, y)], fill=grid_color, width=1)
-            _text_with_backing(draw_overlay, (2, y + 2), str(i), font, text_color, bg_color)
+            draw_overlay.line([(0, y), (w, y)], fill=parsed_line_color, width=line_width)
+            _text_with_backing(draw_overlay, (2, y + 2), str(i), font, parsed_text_color, parsed_bg_color)
             
         # Composite back
         img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         
-    elif style == "fine":
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw_overlay = ImageDraw.Draw(overlay)
-        
-        # Thin gray lines
-        grid_color = (180, 180, 180, 80)
-        text_color = (255, 255, 255, 255)
-        bg_color = (70, 70, 70, 180)
-        
-        for i in range(0, 1001, step):
-            x = i * w / 1000
-            draw_overlay.line([(x, 0), (x, h)], fill=grid_color, width=1)
-            _text_with_backing(draw_overlay, (x + 2, 2), str(i), font, text_color, bg_color)
-            
-        for i in range(0, 1001, step):
-            y = i * h / 1000
-            draw_overlay.line([(0, y), (w, y)], fill=grid_color, width=1)
-            _text_with_backing(draw_overlay, (2, y + 2), str(i), font, text_color, bg_color)
-            
-        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-        
     else:  # standard solid grid
         draw = ImageDraw.Draw(img)
-        grid_color = "red"
         for i in range(0, 1001, step):
             x = i * w / 1000
-            draw.line([(x, 0), (x, h)], fill=grid_color, width=1)
-            _text_with_backing(draw, (x + 2, 2), str(i), font, fill=grid_color)
+            draw.line([(x, 0), (x, h)], fill=parsed_line_color, width=line_width)
+            _text_with_backing(draw, (x + 2, 2), str(i), font, fill=parsed_text_color, backing=parsed_bg_color)
             
         for i in range(0, 1001, step):
             y = i * h / 1000
-            draw.line([(0, y), (w, y)], fill=grid_color, width=1)
-            _text_with_backing(draw, (2, y + 2), str(i), font, fill=grid_color)
+            draw.line([(0, y), (w, y)], fill=parsed_line_color, width=line_width)
+            _text_with_backing(draw, (2, y + 2), str(i), font, fill=parsed_text_color, backing=parsed_bg_color)
             
     return img
 
 def _text_with_backing(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, font: ImageFont.FreeTypeFont, fill: Any, backing: Any = "black", pad: int = 2):
-    """Draw text with a solid backing rectangle."""
+    """Draw text with an optional solid backing rectangle."""
     x, y = xy
-    bbox = draw.textbbox((x, y), text, font=font)
-    draw.rectangle(
-        [bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad],
-        fill=backing,
-    )
+    if backing and str(backing).lower() != "none":
+        bbox = draw.textbbox((x, y), text, font=font)
+        draw.rectangle(
+            [bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad],
+            fill=backing,
+        )
     draw.text((x, y), text, fill=fill, font=font)
 
 def generate_som_proposals(image: Image.Image, min_area_pct: float = 0.0005, max_area_pct: float = 0.3) -> tuple[Image.Image, list[dict[str, Any]]]:
