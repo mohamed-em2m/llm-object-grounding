@@ -409,6 +409,55 @@ class RoundResult:
 
 
 # ---------------------------------------------------------------------------
+# Tiling helpers
+# ---------------------------------------------------------------------------
+
+def _filter_and_translate_feedback_for_tile(
+    feedback: str,
+    tile_x: int,
+    tile_y: int,
+    tile_w: int,
+    tile_h: int,
+    orig_w: int,
+    orig_h: int,
+) -> str:
+    """
+    Filter judge feedback lines so only those referencing coordinates that fall
+    inside the given tile are kept, and translate those coordinates into the
+    tile's local 0-1000 space.
+    """
+    if not feedback:
+        return ""
+    lines = feedback.split("\n")
+    new_lines = []
+    for line in lines:
+        matches = re.findall(r"\((\d+)\s*,\s*(\d+)\)", line)
+        if not matches:
+            new_lines.append(line)
+            continue
+
+        keep_line = False
+        translated_line = line
+        for x_str, y_str in matches:
+            x_val = int(x_str)
+            y_val = int(y_str)
+            px = x_val * orig_w / 1000
+            py = y_val * orig_h / 1000
+
+            if tile_x <= px <= tile_x + tile_w and tile_y <= py <= tile_y + tile_h:
+                keep_line = True
+                tx = int(round((px - tile_x) * 1000 / tile_w))
+                ty = int(round((py - tile_y) * 1000 / tile_h))
+                translated_line = translated_line.replace(f"({x_str},{y_str})", f"({tx},{ty})")
+                translated_line = translated_line.replace(f"({x_str}, {y_str})", f"({tx},{ty})")
+
+        if keep_line:
+            new_lines.append(translated_line)
+
+    return "\n".join(new_lines)
+
+
+# ---------------------------------------------------------------------------
 # Object Detection Pipeline
 # ---------------------------------------------------------------------------
 
@@ -607,38 +656,6 @@ attempt that the reviewer did not flag as wrong.
         feedback_text = feedback_match.group(1).strip() if feedback_match else text.strip()
 
         return score, feedback_text
-
-def _filter_and_translate_feedback_for_tile(feedback: str, tile_x: int, tile_y: int, tile_w: int, tile_h: int, orig_w: int, orig_h: int) -> str:
-    if not feedback:
-        return ""
-    lines = feedback.split("\n")
-    new_lines = []
-    for line in lines:
-        matches = re.findall(r"\((\d+)\s*,\s*(\d+)\)", line)
-        if not matches:
-            new_lines.append(line)
-            continue
-        
-        keep_line = False
-        translated_line = line
-        for x_str, y_str in matches:
-            x_val = int(x_str)
-            y_val = int(y_str)
-            px = x_val * orig_w / 1000
-            py = y_val * orig_h / 1000
-            
-            if tile_x <= px <= tile_x + tile_w and tile_y <= py <= tile_y + tile_h:
-                keep_line = True
-                tx = int(round((px - tile_x) * 1000 / tile_w))
-                ty = int(round((py - tile_y) * 1000 / tile_h))
-                translated_line = translated_line.replace(f"({x_str},{y_str})", f"({tx},{ty})")
-                translated_line = translated_line.replace(f"({x_str}, {y_str})", f"({tx},{ty})")
-        
-        if keep_line:
-            new_lines.append(translated_line)
-            
-    return "\n".join(new_lines)
-
 
     def run(
         self,
