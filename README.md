@@ -1,3 +1,4 @@
+![Preview](assets/image.png)
 # 🔍 LLM Object Detection Testing Console
 
 An interactive test console and command-line tool for assessing and refining Vision-Language Models (VLMs) on general Object Detection tasks. 
