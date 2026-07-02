@@ -253,6 +253,7 @@ def start_server_wrapper(
     kv_cache_type,
     image_min_tokens,
     image_max_tokens,
+    parallel_slots,
 ):
     global server_manager
 
@@ -277,7 +278,7 @@ def start_server_wrapper(
             host=host,
             port=int(port),
             ctx_size=int(ctx_size),
-            parallel_slots=1,
+            parallel_slots=parallel_slots,
             n_threads=-1,
             gpu_layers=int(gpu_layers),
             tensor_split="1,1",
@@ -1226,14 +1227,29 @@ def build_app() -> gr.Blocks:
                                 label="Host Binding", value="0.0.0.0"
                             )
                             server_ctx_input = gr.Number(
-                                label="Context Size", value=20000, precision=0
+                                label="Context Size for each slot",
+                                value=15000,
+                                precision=0,
+                            )
+                            server_parallel_slots_input = gr.Number(
+                                label="Parallel Slots", value=2, precision=0
                             )
                             server_gpu_layers = gr.Number(
                                 label="GPU Layers (-ngl)", value=-1, precision=0
                             )
                             server_kv_cache = gr.Dropdown(
                                 label="KV Cache Type",
-                                choices=["q4_0", "q8_0", "f16"],
+                                choices=[
+                                    "f32",
+                                    "f16",
+                                    "bf16",
+                                    "q8_0",
+                                    "q4_0",
+                                    "q4_1",
+                                    "iq4_nl",
+                                    "q5_0",
+                                    "q5_1",
+                                ],
                                 value="q4_0",
                             )
                             with gr.Row():
@@ -1279,6 +1295,7 @@ def build_app() -> gr.Blocks:
                                 elem_id="server-log-ta",
                             )
                         gr.HTML("</div>")
+                total_ctx = server_ctx_input * server_parallel_slots_input
 
                 start_server_btn.click(
                     start_server_wrapper,
@@ -1288,11 +1305,12 @@ def build_app() -> gr.Blocks:
                         server_host_input,
                         server_thinking_chk,
                         server_mtp_chk,
-                        server_ctx_input,
+                        total_ctx,
                         server_gpu_layers,
                         server_kv_cache,
                         server_img_min_tokens,
                         server_img_max_tokens,
+                        server_parallel_slots_input,
                     ],
                     outputs=[server_logs_viewer, server_status_badge],
                 )
