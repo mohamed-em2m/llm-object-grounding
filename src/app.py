@@ -255,6 +255,7 @@ def start_server_wrapper(
     image_max_tokens,
     parallel_slots,
 ):
+    ctx_size = ctx_size * parallel_slots
     global server_manager
 
     with server_lock:
@@ -1295,7 +1296,6 @@ def build_app() -> gr.Blocks:
                                 elem_id="server-log-ta",
                             )
                         gr.HTML("</div>")
-                total_ctx = server_ctx_input * server_parallel_slots_input
 
                 start_server_btn.click(
                     start_server_wrapper,
@@ -1305,7 +1305,7 @@ def build_app() -> gr.Blocks:
                         server_host_input,
                         server_thinking_chk,
                         server_mtp_chk,
-                        total_ctx,
+                        server_ctx_input,
                         server_gpu_layers,
                         server_kv_cache,
                         server_img_min_tokens,
