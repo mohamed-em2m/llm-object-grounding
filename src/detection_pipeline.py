@@ -484,6 +484,7 @@ class ObjectDetectionPipeline:
         judge_temperature: float = 0.2,
         preprocessing_config: Optional[dict] = None,
         judge_enable_thinking: bool = False,
+        feedback_image_mode: str = "original",
     ):
         """
         `client` is used for both detector and judge calls unless overridden by
@@ -512,6 +513,7 @@ class ObjectDetectionPipeline:
         self.judge_temperature = judge_temperature
         self.preprocessing_config = preprocessing_config or {}
         self.judge_enable_thinking = judge_enable_thinking
+        self.feedback_image_mode = feedback_image_mode
 
     def get_detector_prompt(
         self,
@@ -600,7 +602,7 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
 
     def run_inference(
         self,
-        image_uri,
+        image_uris: str | list[str],
         categories,
         category_definitions,
         feedback=None,
@@ -628,6 +630,16 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
             if extra_body:
                 extra_args["extra_body"] = extra_body
 
+        content_list = [{"type": "text", "text": prompt}]
+        if isinstance(image_uris, list):
+            for i, uri in enumerate(image_uris):
+                if len(image_uris) > 1:
+                    lbl = "Original image with grid:" if i == 0 else "Previous annotated image with grid (for visual feedback of last round):"
+                    content_list.append({"type": "text", "text": lbl})
+                content_list.append({"type": "image_url", "image_url": {"url": uri}})
+        else:
+            content_list.append({"type": "image_url", "image_url": {"url": image_uris}})
+
         def _do_call():
             return self.detector_client.chat.completions.create(
                 model=self.detector_model,
@@ -637,10 +649,7 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                 messages=[
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": image_uri}},
-                        ],
+                        "content": content_list,
                     }
                 ],
                 **extra_args
@@ -826,6 +835,24 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
             parse_error = None
             raw_outputs_collected = []
 
+            # Pre-generate full-size annotated preprocessed image for feedback modes if needed
+            annotated_prep_uri = None
+            annotated_prep_image = None
+            if round_num > 1 and previous_detections_prep is not None:
+                if self.feedback_image_mode in ("annotated", "both"):
+                    annotated_prep_image = render_detections(preprocessed_image, previous_detections_prep)
+                    annotated_prep_with_grid = draw_premium_grid(
+                        annotated_prep_image,
+                        style=grid_style,
+                        step=grid_step,
+                        line_color=grid_line_color,
+                        line_width=grid_line_width,
+                        font_size=grid_font_size,
+                        text_color=grid_text_color,
+                        backing_color=grid_backing_color
+                    )
+                    annotated_prep_uri = pil_to_data_uri(annotated_prep_with_grid)
+
             if tiling_enabled:
                 logger.info("Tiling enabled: dividing image of size %dx%d into tiles of size %d", prep_w, prep_h, tile_size)
                 tiles = get_image_tiles(preprocessed_image, tile_size=tile_size, overlap_pct=tile_overlap)
@@ -857,10 +884,35 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                     )
                     tile_uri = pil_to_data_uri(tile_img_with_grid)
 
+                    detector_images = [tile_uri]
+                    if round_num > 1 and annotated_prep_image is not None:
+                        annotated_tile_crop = annotated_prep_image.crop((
+                            tile["tile_x"],
+                            tile["tile_y"],
+                            tile["tile_x"] + tile["tile_w"],
+                            tile["tile_y"] + tile["tile_h"]
+                        ))
+                        annotated_tile_with_grid = draw_premium_grid(
+                            annotated_tile_crop,
+                            style=grid_style,
+                            step=grid_step,
+                            line_color=grid_line_color,
+                            line_width=grid_line_width,
+                            font_size=grid_font_size,
+                            text_color=grid_text_color,
+                            backing_color=grid_backing_color
+                        )
+                        annotated_tile_uri = pil_to_data_uri(annotated_tile_with_grid)
+
+                        if self.feedback_image_mode == "annotated":
+                            detector_images = [annotated_tile_uri]
+                        elif self.feedback_image_mode == "both":
+                            detector_images = [tile_uri, annotated_tile_uri]
+
                     logger.info("Running parallel detection on Tile %d/%d (at x=%d, y=%d)...", idx, len(tiles), tile["tile_x"], tile["tile_y"])
                     try:
                         tile_raw_text = self.run_inference(
-                            image_uri=tile_uri,
+                            image_uris=detector_images,
                             categories=categories,
                             category_definitions=category_definitions,
                             feedback=tile_feedback,
@@ -924,8 +976,16 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                     logger.info("Generated %d candidate proposal regions", len(som_proposals))
                 
                 grid_uri = pil_to_data_uri(grid_img)
+
+                detector_images = [grid_uri]
+                if round_num > 1 and annotated_prep_uri is not None:
+                    if self.feedback_image_mode == "annotated":
+                        detector_images = [annotated_prep_uri]
+                    elif self.feedback_image_mode == "both":
+                        detector_images = [grid_uri, annotated_prep_uri]
+
                 raw_text = self.run_inference(
-                    image_uri=grid_uri,
+                    image_uris=detector_images,
                     categories=categories,
                     category_definitions=category_definitions,
                     feedback=feedback,

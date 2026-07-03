@@ -446,6 +446,7 @@ def run_batch_detection_gui(
     prep_custom_resize_width,
     prep_custom_resize_height,
     judge_thinking,
+    feedback_image_mode,
 ):
     pipeline_cancel_event.clear()
 
@@ -701,6 +702,7 @@ def run_batch_detection_gui(
                 judge_temperature=judge_temp,
                 preprocessing_config=prep_config,
                 judge_enable_thinking=judge_thinking,
+                feedback_image_mode=feedback_image_mode,
             )
 
             best, _history = pipeline.run(
@@ -1290,6 +1292,12 @@ def _build_batch_tab():
                     value=False,
                     info="Directs the VLM judge backend to use thinking/reasoning outputs (if supported).",
                 )
+                feedback_image_mode_dropdown = gr.Dropdown(
+                    label="Feedback Image Mode (Round > 1)",
+                    choices=["original", "annotated", "both"],
+                    value="original",
+                    info="Choose which images are sent to the detector in subsequent rounds (clean original, annotated with previous boxes, or both).",
+                )
 
             with gr.Accordion("Image Preprocessing & Augmentation", open=False):
                 prep_enabled_chk = gr.Checkbox(
@@ -1586,6 +1594,7 @@ def _build_batch_tab():
         det_temp_slider=det_temp_slider,
         jdg_temp_slider=jdg_temp_slider,
         judge_thinking_chk=judge_thinking_chk,
+        feedback_image_mode_dropdown=feedback_image_mode_dropdown,
         prep_enabled_chk=prep_enabled_chk,
         prep_options_group=prep_options_group,
         prep_short_edge_slider=prep_short_edge_slider,
@@ -1826,6 +1835,7 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
             c_bat["prep_custom_resize_width"],
             c_bat["prep_custom_resize_height"],
             c_bat["judge_thinking_chk"],
+            c_bat["feedback_image_mode_dropdown"],
         ],
         outputs=[
             c_bat["pipeline_status"],
