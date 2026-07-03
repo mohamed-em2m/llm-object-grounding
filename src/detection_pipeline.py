@@ -16,6 +16,10 @@ Key features:
     history are written to disk.
   - Prompts are loaded from src/prompts/*.md files (with hardcoded fallbacks).
   - Basic input validation (image exists, categories non-empty).
+  - external_api mode: when True, only official OpenAI-compatible request
+    parameters are ever sent (no vLLM/Qwen-VL extra_body extensions like
+    min_pixels/max_pixels/enable_thinking, and sampling params can be
+    disabled for reasoning models that reject temperature/top_p).
 """
 
 from __future__ import annotations
@@ -238,10 +242,22 @@ def render_detections(base_image: Image.Image, detections: list[dict]) -> Image.
 
 
 def pil_to_data_uri(img: Image.Image, fmt: str = "JPEG") -> str:
+    """
+    Encode a PIL image as a base64 data URI.
+
+    JPEG cannot encode alpha/palette/CMYK modes (RGBA, P, LA, CMYK, etc.) —
+    Pillow raises OSError: cannot write mode X as JPEG in that case. Convert
+    to RGB first whenever the target format is JPEG.
+    """
+    fmt_norm = "JPEG" if fmt.upper() in ("JPEG", "JPG") else fmt.upper()
+    save_img = img
+    if fmt_norm == "JPEG" and img.mode != "RGB":
+        save_img = img.convert("RGB")
+
     buffer = io.BytesIO()
-    img.save(buffer, format=fmt)
+    save_img.save(buffer, format=fmt_norm)
     encoded = base64.b64encode(buffer.getvalue()).decode()
-    return f"data:image/{fmt.lower()};base64,{encoded}"
+    return f"data:image/{fmt_norm.lower()};base64,{encoded}"
 
 
 # ---------------------------------------------------------------------------
@@ -485,12 +501,24 @@ class ObjectDetectionPipeline:
         preprocessing_config: Optional[dict] = None,
         judge_enable_thinking: bool = False,
         feedback_image_mode: str = "original",
+        external_api: bool = False,
+        sampling_params_supported: bool = True,
     ):
         """
         `client` is used for both detector and judge calls unless overridden by
         `detector_client` / `judge_client` — pass distinct clients (e.g. pointed
         at two different llama-server instances/ports) to run detection and
         judging against different models.
+
+        `external_api`: when True, this pipeline is talking to the official
+        OpenAI API (or another strict OpenAI-compatible endpoint) rather than
+        a self-hosted vLLM/llama-server backend. In that mode:
+          - `extra_body` params that only local/vLLM backends understand
+            (min_pixels, max_pixels, enable_thinking) are never sent, since
+            the official API rejects unrecognized request fields.
+          - Set `sampling_params_supported=False` if pointing detector_model
+            at an OpenAI reasoning model (e.g. an o-series model) that
+            rejects `temperature`/`top_p` in the request body.
         """
         self.detector_client = detector_client or client
         self.judge_client = judge_client or client
@@ -514,6 +542,43 @@ class ObjectDetectionPipeline:
         self.preprocessing_config = preprocessing_config or {}
         self.judge_enable_thinking = judge_enable_thinking
         self.feedback_image_mode = feedback_image_mode
+        self.external_api = external_api
+        self.sampling_params_supported = sampling_params_supported
+
+        if self.external_api:
+            self._warn_ignored_local_only_settings()
+
+    def _warn_ignored_local_only_settings(self) -> None:
+        """Log once, at construction time, if local-backend-only settings will be silently ignored."""
+        ignored = []
+        if self.preprocessing_config.get("send_pixel_bounds"):
+            ignored.append("preprocessing_config['send_pixel_bounds'] (min_pixels/max_pixels)")
+        if self.judge_enable_thinking:
+            ignored.append("judge_enable_thinking")
+        if ignored:
+            logger.warning(
+                "external_api=True: the following local-backend-only settings will be "
+                "ignored since the official OpenAI API rejects unrecognized request "
+                "fields: %s",
+                ", ".join(ignored),
+            )
+
+    def _pixel_bounds_extra_args(self) -> dict:
+        """
+        Build extra_body kwargs for Qwen-VL/vLLM-style min_pixels/max_pixels hints.
+        Always empty when external_api=True — the official OpenAI API 400s on
+        unrecognized request fields.
+        """
+        if self.external_api:
+            return {}
+        if not self.preprocessing_config.get("send_pixel_bounds"):
+            return {}
+        extra_body = {}
+        if self.preprocessing_config.get("min_pixels") is not None:
+            extra_body["min_pixels"] = int(self.preprocessing_config["min_pixels"])
+        if self.preprocessing_config.get("max_pixels") is not None:
+            extra_body["max_pixels"] = int(self.preprocessing_config["max_pixels"])
+        return {"extra_body": extra_body} if extra_body else {}
 
     def get_detector_prompt(
         self,
@@ -619,16 +684,10 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
             som_proposals=som_proposals,
         )
 
-        # Prepare extra parameters (e.g. min_pixels, max_pixels) for Qwen-VL or vLLM backends if enabled
-        extra_args = {}
-        if self.preprocessing_config.get("send_pixel_bounds"):
-            extra_body = {}
-            if self.preprocessing_config.get("min_pixels") is not None:
-                extra_body["min_pixels"] = int(self.preprocessing_config["min_pixels"])
-            if self.preprocessing_config.get("max_pixels") is not None:
-                extra_body["max_pixels"] = int(self.preprocessing_config["max_pixels"])
-            if extra_body:
-                extra_args["extra_body"] = extra_body
+        # Non-standard sampling/vision hints (Qwen-VL min/max pixels) are only
+        # ever sent to local/self-hosted OpenAI-compatible backends, never to
+        # the official OpenAI API (external_api=True).
+        extra_args = self._pixel_bounds_extra_args()
 
         content_list = [{"type": "text", "text": prompt}]
         if isinstance(image_uris, list):
@@ -641,10 +700,8 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
             content_list.append({"type": "image_url", "image_url": {"url": image_uris}})
 
         def _do_call():
-            return self.detector_client.chat.completions.create(
+            kwargs = dict(
                 model=self.detector_model,
-                temperature=self.detector_temperature,
-                top_p=self.detector_top_p,
                 max_tokens=self.detector_max_tokens,
                 messages=[
                     {
@@ -652,8 +709,14 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                         "content": content_list,
                     }
                 ],
-                **extra_args
+                **extra_args,
             )
+            # temperature/top_p are standard Chat Completions params, but some
+            # OpenAI reasoning models reject them outright — allow opting out.
+            if self.sampling_params_supported:
+                kwargs["temperature"] = self.detector_temperature
+                kwargs["top_p"] = self.detector_top_p
+            return self.detector_client.chat.completions.create(**kwargs)
 
         response = _call_with_retries(_do_call, retries=self.api_retries, what="Detector call")
         return response.choices[0].message.content
@@ -666,21 +729,11 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
         crop_uri = pil_to_data_uri(crop_image)
         prompt = f"Analyze this image crop carefully. Is there a visible '{label}' present inside this crop? You must respond in exactly this format, with nothing else: <present>YES</present> or <present>NO</present>."
 
-        # Prepare extra parameters if enabled
-        extra_args = {}
-        if self.preprocessing_config.get("send_pixel_bounds"):
-            extra_body = {}
-            if self.preprocessing_config.get("min_pixels") is not None:
-                extra_body["min_pixels"] = int(self.preprocessing_config["min_pixels"])
-            if self.preprocessing_config.get("max_pixels") is not None:
-                extra_body["max_pixels"] = int(self.preprocessing_config["max_pixels"])
-            if extra_body:
-                extra_args["extra_body"] = extra_body
+        extra_args = self._pixel_bounds_extra_args()
 
         def _do_call():
-            return self.detector_client.chat.completions.create(
+            kwargs = dict(
                 model=self.detector_model,
-                temperature=0.1,  # low temp for validation
                 max_tokens=50,
                 messages=[
                     {
@@ -691,8 +744,11 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                         ],
                     }
                 ],
-                **extra_args
+                **extra_args,
             )
+            if self.sampling_params_supported:
+                kwargs["temperature"] = 0.1  # low temp for validation
+            return self.detector_client.chat.completions.create(**kwargs)
 
         try:
             response = _call_with_retries(_do_call, retries=self.api_retries, what="Crop verification call")
@@ -709,14 +765,15 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
     def judge_detections(self, original_grid_uri, annotated_grid_uri, detections, category_definitions):
         prompt = self.get_judge_prompt(category_definitions, detections)
 
+        # `enable_thinking` is a vLLM-only extra_body flag — never sent to the
+        # official OpenAI API.
         extra_args = {}
-        if self.judge_enable_thinking:
+        if self.judge_enable_thinking and not self.external_api:
             extra_args["extra_body"] = {"enable_thinking": True}
 
         def _do_call():
-            return self.judge_client.chat.completions.create(
+            kwargs = dict(
                 model=self.judge_model,
-                temperature=self.judge_temperature,
                 max_tokens=self.judge_max_tokens,
                 messages=[
                     {
@@ -730,8 +787,11 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                         ],
                     }
                 ],
-                **extra_args
+                **extra_args,
             )
+            if self.sampling_params_supported:
+                kwargs["temperature"] = self.judge_temperature
+            return self.judge_client.chat.completions.create(**kwargs)
 
         response = _call_with_retries(_do_call, retries=self.api_retries, what="Judge call")
         text = _strip_think_blocks(response.choices[0].message.content)
@@ -857,9 +917,9 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                 logger.info("Tiling enabled: dividing image of size %dx%d into tiles of size %d", prep_w, prep_h, tile_size)
                 tiles = get_image_tiles(preprocessed_image, tile_size=tile_size, overlap_pct=tile_overlap)
                 logger.info("Generated %d tiles", len(tiles))
-                
+
                 all_tile_detections = []
-                
+
                 def process_tile(tile_item):
                     idx, tile = tile_item
                     tile_feedback = _filter_and_translate_feedback_for_tile(
@@ -920,7 +980,7 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                             som_proposals=None
                         )
                         tile_dets = validate_detections(parse_detections(tile_raw_text), categories)
-                        
+
                         mapped_dets = []
                         for det in tile_dets:
                             mapped = map_tile_detection_to_original(
@@ -967,14 +1027,14 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                     text_color=grid_text_color,
                     backing_color=grid_backing_color
                 )
-                
+
                 # Overlay Set-of-Mark proposals if enabled
                 som_proposals = None
                 if self.preprocessing_config.get("som_enabled", False):
                     logger.info("Set-of-Mark (SoM) prompting enabled. Generating candidate regions...")
                     grid_img, som_proposals = generate_som_proposals(grid_img)
                     logger.info("Generated %d candidate proposal regions", len(som_proposals))
-                
+
                 grid_uri = pil_to_data_uri(grid_img)
 
                 detector_images = [grid_uri]
@@ -993,7 +1053,7 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                     previous_detections=previous_detections_prep,
                     som_proposals=som_proposals
                 )
-                
+
                 try:
                     detections_prep = validate_detections(parse_detections(raw_text), categories)
                 except ValueError as exc:
@@ -1006,42 +1066,42 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
             if detections_prep and self.preprocessing_config.get("crop_verify_enabled", False):
                 crop_padding = self.preprocessing_config.get("crop_padding", 0.15)
                 logger.info("Crop & Verify validation enabled. Validating %d detections...", len(detections_prep))
-                
+
                 verified_detections = []
-                
+
                 def verify_single(det):
                     x1, y1, x2, y2 = det["bbox_2d"]
                     px1 = x1 * prep_w / 1000
                     py1 = y1 * prep_h / 1000
                     px2 = x2 * prep_w / 1000
                     py2 = y2 * prep_h / 1000
-                    
+
                     pw = px2 - px1
                     ph = py2 - py1
                     pad_w = pw * crop_padding
                     pad_h = ph * crop_padding
-                    
+
                     cx1 = max(0, int(px1 - pad_w))
                     cy1 = max(0, int(py1 - pad_h))
                     cx2 = min(prep_w, int(px2 + pad_w))
                     cy2 = min(prep_h, int(py2 + pad_h))
-                    
+
                     if cx2 - cx1 < 10 or cy2 - cy1 < 10:
                         return det, True
-                        
+
                     crop_img = preprocessed_image.crop((cx1, cy1, cx2, cy2))
                     is_valid = self.verify_crop(crop_img, det["label"])
                     return det, is_valid
 
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     verification_results = list(executor.map(verify_single, detections_prep))
-                    
+
                 for det, is_valid in verification_results:
                     if is_valid:
                         verified_detections.append(det)
                     else:
                         logger.info("Crop & Verify: discarded detection box %s for label '%s'", det["bbox_2d"], det["label"])
-                        
+
                 detections_prep = verified_detections
 
             # 7. Map coordinates from preprocessed scale back to the original image scale
@@ -1052,7 +1112,7 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
 
             # Render detections on the original scale base image for visualization
             annotated_orig = render_detections(base_image_raw, detections_orig)
-            
+
             # Draw preprocessed annotated view with grid for the judge
             annotated_prep = render_detections(preprocessed_image, detections_prep)
             annotated_prep_with_grid = draw_premium_grid(
@@ -1066,7 +1126,7 @@ A separate quality-control reviewer inspected your last attempt on this image.{p
                 backing_color=grid_backing_color
             )
             annotated_prep_uri = pil_to_data_uri(annotated_prep_with_grid)
-            
+
             # Setup original scale background with grid for the judge
             grid_original_prep = draw_premium_grid(
                 preprocessed_image,
@@ -1170,12 +1230,12 @@ FabricDefectPipeline = ObjectDetectionPipeline
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    api_client = OpenAI(
+    # Example A: local/self-hosted OpenAI-compatible backend (vLLM, llama-server, etc.)
+    local_client = OpenAI(
         api_key="not-needed",
         base_url="http://localhost:8080/v1",
     )
 
-    # Example: general object detection
     categories = ["person", "car", "bicycle", "dog", "cat"]
     definitions = """
 - person: a human being
@@ -1186,17 +1246,30 @@ if __name__ == "__main__":
 """
     image_path = "/path/to/your/image.jpg"
 
-    pipeline = ObjectDetectionPipeline(
-        client=api_client,
+    local_pipeline = ObjectDetectionPipeline(
+        client=local_client,
         detector_model="local-model",
         judge_model="local-model",
         max_rounds=2,
         score_threshold=8,
+        external_api=False,  # OK to use extra_body (min_pixels/max_pixels, enable_thinking)
     )
 
-    best_res, run_hist = pipeline.run(
+    best_res, run_hist = local_pipeline.run(
         image_path=image_path,
         categories=categories,
         category_definitions=definitions,
         output_dir="./detection_output",
     )
+
+    # Example B: official OpenAI API — only standard Chat Completions params are sent
+    # openai_client = OpenAI(api_key="sk-...")
+    # openai_pipeline = ObjectDetectionPipeline(
+    #     client=openai_client,
+    #     detector_model="gpt-4.1",
+    #     judge_model="gpt-4.1",
+    #     max_rounds=2,
+    #     score_threshold=8,
+    #     external_api=True,
+    #     # sampling_params_supported=False,  # set False only if detector_model is a reasoning model
+    # )

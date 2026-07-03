@@ -705,6 +705,7 @@ def run_batch_detection_gui(
                 preprocessing_config=prep_config,
                 judge_enable_thinking=judge_thinking,
                 feedback_image_mode=feedback_image_mode,
+                external_api=use_external_api
             )
 
             best, _history = pipeline.run(
