@@ -133,9 +133,9 @@ You are shown two images of the same subject, both with a red coordinate grid (0
 ## Your job
 Critically compare the two images and evaluate the annotated image's quality:
 1. Coverage: are there visible target objects in the original image that were NOT detected? List each with its approximate (x,y) grid location.
-2. Correctness: for each detected box, is the label correct given the definitions above? List any mislabeled boxes and what they should be instead.
-3. False positives: any boxes drawn over background with no real target object? List them.
-4. Bounding box quality: for each box, is it tight around the object, or too loose / too tight / offset? Give specific fixes referencing approximate coordinates.
+2. Correctness: for each detected box, is the label correct given the definitions above? Check the box indices provided in the reference JSON list and identify any mislabeled ones.
+3. False positives: any boxes drawn over background with no real target object? Identify them by their box index.
+4. Bounding box quality: for each box, is it tight around the object, or too loose / too tight / offset? Reference the box indices and give specific fixes.
 5. Duplicates: any single object annotated more than once with overlapping boxes?
 
 ## Output
@@ -143,15 +143,15 @@ Respond in exactly this format, nothing else:
 
 <score>N</score>
 <feedback>
-A concise, actionable bullet list of concrete fixes for the next detection attempt, each with
-approximate 0-1000 coordinates where relevant (e.g. "Missed a small target near (650,300)",
-"Box labeled 'A' near (200,800) should be 'B'", "Tighten the box at top-left, left edge extends ~40px into empty area", "Remove duplicate box near (400,400)").
+A concise, actionable bullet list of concrete fixes for the next detection attempt.
+For any modifications or deletions of existing detections, ALWAYS reference them by their Box Index (e.g. "Box #1 is mislabeled; should be 'weaving_defect'", "Box #3 is too loose; pull the right edge in by ~30px", "Remove false positive Box #5").
+For missed objects, specify their approximate coordinates (e.g. "Missed a small target near (650,300)").
 If the annotation is already excellent, state that explicitly and say no changes are needed.
 </feedback>
 
 N is an integer 0-10 (10 = perfect coverage, correct labels, tight boxes, no false positives or duplicates).
 
-Raw JSON detections produced by the agent, for reference:
+Raw detections produced by the agent, indexed for reference:
 {detections_json}
 """
 
@@ -219,7 +219,7 @@ def render_detections(base_image: Image.Image, detections: list[dict]) -> Image.
     w, h = img.size
     font = _load_font(max(12, min(w, h) // 50))
 
-    for item in detections:
+    for idx, item in enumerate(detections, 1):
         bbox = item.get("bbox_2d")
         if not bbox or len(bbox) != 4:
             continue
@@ -232,7 +232,8 @@ def render_detections(base_image: Image.Image, detections: list[dict]) -> Image.
         bottom = ymax * h / 1000
         draw.rectangle([left, top, right, bottom], outline="lime", width=4)
         label_y = max(0, top - 18)
-        _text_with_backing(draw, (left + 2, label_y), item.get("label", "object"), font, fill="lime")
+        label_text = f"#{idx}: {item.get('label', 'object')}"
+        _text_with_backing(draw, (left + 2, label_y), label_text, font, fill="lime")
     return img
 
 
@@ -481,6 +482,7 @@ class ObjectDetectionPipeline:
         detector_top_p: float = 0.95,
         judge_temperature: float = 0.2,
         preprocessing_config: Optional[dict] = None,
+        judge_enable_thinking: bool = False,
     ):
         """
         `client` is used for both detector and judge calls unless overridden by
@@ -508,6 +510,7 @@ class ObjectDetectionPipeline:
         self.detector_top_p = detector_top_p
         self.judge_temperature = judge_temperature
         self.preprocessing_config = preprocessing_config or {}
+        self.judge_enable_thinking = judge_enable_thinking
 
     def get_detector_prompt(self, categories, category_definitions, feedback=None, som_proposals=None):
         feedback_block = ""
@@ -536,9 +539,18 @@ attempt that the reviewer did not flag as wrong.
         )
 
     def get_judge_prompt(self, category_definitions, detections):
+        # Format detections list with Box Indices to help the judge easily reference them
+        indexed_detections = []
+        for idx, det in enumerate(detections, 1):
+            indexed_detections.append({
+                "box_index": f"Box #{idx}",
+                "label": det.get("label"),
+                "bbox_2d": det.get("bbox_2d")
+            })
+
         return self.judge_template.format(
             category_definitions=category_definitions,
-            detections_json=json.dumps(detections),
+            detections_json=json.dumps(indexed_detections, indent=2),
         )
 
     def run_inference(self, image_uri, categories, category_definitions, feedback=None, som_proposals=None) -> str:
@@ -627,6 +639,10 @@ attempt that the reviewer did not flag as wrong.
     def judge_detections(self, original_grid_uri, annotated_grid_uri, detections, category_definitions):
         prompt = self.get_judge_prompt(category_definitions, detections)
 
+        extra_args = {}
+        if self.judge_enable_thinking:
+            extra_args["extra_body"] = {"enable_thinking": True}
+
         def _do_call():
             return self.judge_client.chat.completions.create(
                 model=self.judge_model,
@@ -644,6 +660,7 @@ attempt that the reviewer did not flag as wrong.
                         ],
                     }
                 ],
+                **extra_args
             )
 
         response = _call_with_retries(_do_call, retries=self.api_retries, what="Judge call")
@@ -745,8 +762,9 @@ attempt that the reviewer did not flag as wrong.
                 logger.info("Generated %d tiles", len(tiles))
                 
                 all_tile_detections = []
-                for idx, tile in enumerate(tiles, 1):
-                    # Filter feedback coordinates for this tile local system
+                
+                def process_tile(tile_item):
+                    idx, tile = tile_item
                     tile_feedback = _filter_and_translate_feedback_for_tile(
                         feedback,
                         tile_x=tile["tile_x"],
@@ -769,7 +787,7 @@ attempt that the reviewer did not flag as wrong.
                     )
                     tile_uri = pil_to_data_uri(tile_img_with_grid)
 
-                    logger.info("Running detection on Tile %d/%d (at x=%d, y=%d)...", idx, len(tiles), tile["tile_x"], tile["tile_y"])
+                    logger.info("Running parallel detection on Tile %d/%d (at x=%d, y=%d)...", idx, len(tiles), tile["tile_x"], tile["tile_y"])
                     try:
                         tile_raw_text = self.run_inference(
                             image_uri=tile_uri,
@@ -778,10 +796,9 @@ attempt that the reviewer did not flag as wrong.
                             feedback=tile_feedback,
                             som_proposals=None
                         )
-                        raw_outputs_collected.append(f"Tile {idx} (x={tile['tile_x']}, y={tile['tile_y']}):\n{tile_raw_text}")
                         tile_dets = validate_detections(parse_detections(tile_raw_text), categories)
                         
-                        # Map tile local detections back to full preprocessed scale (0-1000)
+                        mapped_dets = []
                         for det in tile_dets:
                             mapped = map_tile_detection_to_original(
                                 det["bbox_2d"],
@@ -793,10 +810,23 @@ attempt that the reviewer did not flag as wrong.
                                 orig_h=prep_h
                             )
                             det["bbox_2d"] = mapped
-                            all_tile_detections.append(det)
+                            mapped_dets.append(det)
+                        return (idx, tile_raw_text, mapped_dets, None)
                     except Exception as exc:
                         logger.error("Failed detection on tile %d: %s", idx, exc)
-                        parse_error = str(exc) if not parse_error else parse_error + f"; Tile {idx}: {exc}"
+                        return (idx, "", [], str(exc))
+
+                with ThreadPoolExecutor(max_workers=min(4, len(tiles))) as pool:
+                    tile_results = list(pool.map(process_tile, enumerate(tiles, 1)))
+
+                tile_results.sort(key=lambda x: x[0])
+                for idx, tile_raw_text, mapped_dets, err in tile_results:
+                    if tile_raw_text:
+                        raw_outputs_collected.append(f"Tile {idx} (x={tiles[idx-1]['tile_x']}, y={tiles[idx-1]['tile_y']}):\n{tile_raw_text}")
+                    if mapped_dets:
+                        all_tile_detections.extend(mapped_dets)
+                    if err:
+                        parse_error = str(err) if not parse_error else parse_error + f"; Tile {idx}: {err}"
 
                 # Merge tile detections using Non-Maximum Suppression
                 detections_prep = apply_nms(all_tile_detections, iou_threshold=0.5)

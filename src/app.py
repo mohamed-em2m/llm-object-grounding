@@ -153,6 +153,20 @@ def _tail(s: str, n: int = LOG_TAIL_BYTES) -> str:
     return "...[log tail truncated]...\n" + s[-n:]
 
 
+DISPLAY_MAX_PX = 1280  # max long-edge pixels sent to the browser
+
+
+def _thumb(img: Optional[Image.Image], max_px: int = DISPLAY_MAX_PX) -> Optional[Image.Image]:
+    """Return a display-sized copy of *img* so large images don't stall the UI."""
+    if img is None:
+        return None
+    w, h = img.size
+    if max(w, h) <= max_px:
+        return img
+    scale = max_px / max(w, h)
+    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+
 def _render_progress_bar(pct: int, status: str = "") -> str:
     pct = max(0, min(100, int(pct)))
     return f"""
@@ -431,6 +445,7 @@ def run_batch_detection_gui(
     prep_custom_resize_enabled,
     prep_custom_resize_width,
     prep_custom_resize_height,
+    judge_thinking,
 ):
     pipeline_cancel_event.clear()
 
@@ -685,6 +700,7 @@ def run_batch_detection_gui(
                 detector_top_p=0.95,
                 judge_temperature=judge_temp,
                 preprocessing_config=prep_config,
+                judge_enable_thinking=judge_thinking,
             )
 
             best, _history = pipeline.run(
@@ -985,7 +1001,7 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
         )
 
     img_data = batch_results[selected_image]
-    src_img = img_data["grid_original"] if show_grid else img_data["raw_original"]
+    src_img = _thumb(img_data["grid_original"] if show_grid else img_data["raw_original"])
 
     if not selected_round or selected_round == "Final Best":
         best_annotated = img_data["best_annotated"]
@@ -1005,7 +1021,7 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
                 best_raw = r["raw_text"]
                 best_err = r["parse_error"]
 
-        display_img = best_annotated if best_detections else src_img
+        display_img = _thumb(best_annotated) if best_detections else src_img
 
         if best_score >= 0:
             score_text = f'<span class="score-badge">Best Score: {best_score}/10 (Round {best_round_num})</span>'
@@ -1031,7 +1047,7 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
         if 0 <= round_idx < len(rounds):
             r = rounds[round_idx]
             round_detections = r.get("detections") or []
-            display_img = r["image"] if round_detections else src_img
+            display_img = _thumb(r["image"]) if round_detections else src_img
             score_text = f'<span class="score-badge">Score: {r["score"]}/10</span>'
             return (
                 src_img,
@@ -1074,7 +1090,7 @@ def toggle_external_api(use_external):
         gr.update(interactive=not use_external),  # server_port_input
         gr.update(interactive=not use_external),  # server_thinking_chk
         gr.update(interactive=not use_external),  # server_mtp_chk
-        gr.update(visible=use_external),           # ext_api_group
+        gr.update(visible=use_external, open=use_external),  # ext_api_group accordion
     )
 
 
@@ -1269,6 +1285,11 @@ def _build_batch_tab():
                     label="Judge Temperature",
                     minimum=0.0, maximum=1.5, step=0.05, value=0.2,
                 )
+                judge_thinking_chk = gr.Checkbox(
+                    label="Enable Judge Thinking Mode",
+                    value=False,
+                    info="Directs the VLM judge backend to use thinking/reasoning outputs (if supported).",
+                )
 
             with gr.Accordion("Image Preprocessing & Augmentation", open=False):
                 prep_enabled_chk = gr.Checkbox(
@@ -1420,10 +1441,12 @@ def _build_batch_tab():
                             label="max_pixels", value=4194304, precision=0, info="Default: 2048×2048",
                         )
 
-            with gr.Accordion("External API (Optional)", open=False) as ext_api_group:
-                use_external_api_chk = gr.Checkbox(
-                    label="Use External API instead of Local Server", value=False,
-                )
+            use_external_api_chk = gr.Checkbox(
+                label="Use External API instead of Local Server",
+                value=False,
+                info="When enabled, all requests are sent to the external endpoint below instead of the local llama-server.",
+            )
+            with gr.Accordion("External API Settings", open=False, visible=False) as ext_api_group:
                 ext_api_url = gr.Textbox(label="Base URL", value="https://api.openai.com/v1")
                 ext_api_key = gr.Textbox(
                     label="API Key", placeholder="sk-...", value="", type="password",
@@ -1562,6 +1585,7 @@ def _build_batch_tab():
         score_threshold_slider=score_threshold_slider,
         det_temp_slider=det_temp_slider,
         jdg_temp_slider=jdg_temp_slider,
+        judge_thinking_chk=judge_thinking_chk,
         prep_enabled_chk=prep_enabled_chk,
         prep_options_group=prep_options_group,
         prep_short_edge_slider=prep_short_edge_slider,
@@ -1801,6 +1825,7 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
             c_bat["prep_custom_resize_chk"],
             c_bat["prep_custom_resize_width"],
             c_bat["prep_custom_resize_height"],
+            c_bat["judge_thinking_chk"],
         ],
         outputs=[
             c_bat["pipeline_status"],
