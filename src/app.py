@@ -201,6 +201,8 @@ def start_server_wrapper(
     image_min_tokens,
     image_max_tokens,
     parallel_slots,
+    batch_size,
+    ubatch_size
 ):
     ctx_size = ctx_size * parallel_slots
     global server_manager
@@ -237,8 +239,8 @@ def start_server_wrapper(
             spec_type=spec_type,
             spec_draft_n_max=4 if enable_mtp else 0,
             enable_thinking=enable_thinking,
-            batch_size=1024,
-            ubatch_size=512,
+            batch_size=batch_size,
+            ubatch_size=ubatch_size,
             kv_cache_type=kv_cache_type,
             image_min_tokens=(
                 int(image_min_tokens) if image_min_tokens is not None else 1024
@@ -1159,6 +1161,12 @@ def _build_server_tab(server_status_badge):
                 server_parallel_slots_input = gr.Number(
                     label="Parallel Slots", value=2, precision=0
                 )
+                server_batch_size = gr.Number(
+                    label="Batch Size", value=1024, precision=0
+                )
+                server_ubatch_size = gr.Number(
+                    label="Unbatched Size", value=512, precision=0
+                )
                 server_gpu_layers = gr.Number(
                     label="GPU Layers (-ngl)", value=-1, precision=0
                 )
@@ -1227,6 +1235,8 @@ def _build_server_tab(server_status_badge):
         server_mtp_chk=server_mtp_chk,
         server_ctx_input=server_ctx_input,
         server_parallel_slots_input=server_parallel_slots_input,
+        server_batch_size=server_batch_size,
+        server_ubatch_size=server_ubatch_size,
         server_gpu_layers=server_gpu_layers,
         server_kv_cache=server_kv_cache,
         server_img_min_tokens=server_img_min_tokens,
@@ -1725,6 +1735,8 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
             c_srv["server_img_min_tokens"],
             c_srv["server_img_max_tokens"],
             c_srv["server_parallel_slots_input"],
+            c_srv["server_batch_size"],
+            c_srv["server_ubatch_size"],
         ],
         outputs=[c_srv["server_logs_viewer"], server_status_badge],
     )

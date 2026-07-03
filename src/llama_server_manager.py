@@ -49,7 +49,7 @@ class LlamaServerManager:
         self.spec_draft_n_max = spec_draft_n_max
         self.fa = fa
         self.enable_thinking = enable_thinking
-        self.batch_size = batch_size
+        self.batch_size = max(batch_size, ubatch_size)
         self.ubatch_size = ubatch_size
         self.kv_cache_type = kv_cache_type
         self.image_min_tokens = image_min_tokens
