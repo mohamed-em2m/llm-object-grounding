@@ -32,9 +32,9 @@ def init_llama_server(args):
     llama_manager = LlamaServerManager(
         model=args.model,
         host="localhost",
-        port=args.port,
-        ctx_size=args.ctx_size,
-        parallel_slots=args.parallel_slots,
+        port=8080,
+        ctx_size=20000,
+        parallel_slots=1,
         n_threads=-1,
         gpu_layers=-1,
         tensor_split="1,1",
@@ -42,10 +42,10 @@ def init_llama_server(args):
         temp=0.4,
         top_p=0.95,
         top_k=64,
-        spec_type="draft-mtp" if args.use_mtp else "none",
-        spec_draft_n_max=4 if args.use_mtp else 0,
+        spec_type="draft-mtp",
+        spec_draft_n_max=4,
         fa="auto",
-        enable_thinking=args.enable_thinking,
+        enable_thinking=False,
         batch_size=1024,
         ubatch_size=512,
         kv_cache_type="q4_0",
@@ -330,7 +330,7 @@ def build_client(args):
     """--use_llama_model True -> local llama.cpp server. Otherwise -> external API."""
     if args.use_llama_model:
         llama_manager = init_llama_server(args)
-        client = OpenAI(base_url=f"http://localhost:{args.port}/v1", api_key="")
+        client = OpenAI(base_url="http://localhost:8080/v1", api_key="")
         return client, llama_manager
     else:
         client = OpenAI(base_url=args.base_url, api_key=args.api_key)
@@ -349,47 +349,6 @@ def parse_args():
         "--use_llama_model",
         action="store_true",
         help="Use a local llama.cpp server instead of an external API.",
-    )
-    parser.add_argument(
-        "--enable_thinking",
-        action="store_true",
-        help="Enable the model's thinking/reasoning mode on the local llama.cpp server "
-        "(--use_llama_model only). Off by default: faster and usually unnecessary for a "
-        "single classify-this-crop call.",
-    )
-    parser.add_argument(
-        "--use_mtp",
-        action="store_true",
-        default=True,
-        help="Enable draft-MTP speculative decoding on the local llama.cpp server "
-        "(--use_llama_model only). On by default for speed; pass --no_mtp to disable it "
-        "if you hit compatibility issues with a given model/build.",
-    )
-    parser.add_argument(
-        "--no_mtp",
-        action="store_false",
-        dest="use_mtp",
-        help="Disable draft-MTP speculative decoding (--use_llama_model only).",
-    )
-    parser.add_argument(
-        "--ctx_size",
-        type=int,
-        default=20000,
-        help="Context size for the local llama.cpp server (--use_llama_model only).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8080,
-        help="Port for the local llama.cpp server (--use_llama_model only).",
-    )
-    parser.add_argument(
-        "--parallel_slots",
-        type=int,
-        default=1,
-        help="Number of parallel inference slots on the local llama.cpp server "
-        "(--use_llama_model only). If you raise this, --max_workers can be raised to match "
-        "so multiple images are in flight at once.",
     )
     parser.add_argument("--train_image", type=str, required=True, help="Path to the folder of training images.")
     parser.add_argument("--train_label", type=str, required=True, help="Path to the folder of YOLO training labels.")
