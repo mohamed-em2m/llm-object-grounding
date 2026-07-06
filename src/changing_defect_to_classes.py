@@ -22,19 +22,21 @@ from pathlib import Path
 
 import cv2
 import json_repair
+import numpy as np
 import yaml
 from openai import OpenAI
+from PIL import Image
 
 from llama_server_manager import LlamaServerManager
-
+from image_preprocessing import preprocess_custom_resize
 
 def init_llama_server(args):
     llama_manager = LlamaServerManager(
         model=args.model,
         host="localhost",
-        port=8080,
-        ctx_size=20000,
-        parallel_slots=1,
+        port=args.port,
+        ctx_size=args.ctx_size,
+        parallel_slots=args.parallel_slots,
         n_threads=-1,
         gpu_layers=-1,
         tensor_split="1,1",
@@ -42,15 +44,15 @@ def init_llama_server(args):
         temp=0.4,
         top_p=0.95,
         top_k=64,
-        spec_type="draft-mtp",
-        spec_draft_n_max=4,
+        spec_type="draft-mtp" if args.use_mtp else "none",
+        spec_draft_n_max=4 if args.use_mtp else 0,
         fa="auto",
-        enable_thinking=False,
+        enable_thinking=args.enable_thinking,
         batch_size=1024,
-        ubatch_size=512,
+        ubatch_size=1024,
         kv_cache_type="q4_0",
-        image_min_tokens=1024,
-        image_max_tokens=4096,
+        image_min_tokens=args.image_min_tokens,
+        image_max_tokens=args.image_max_tokens,
     )
     llama_manager.start_llama_server()
     llama_manager.server_ready_event.wait(timeout=120)
@@ -128,6 +130,8 @@ def process_one_image(
     conf_threshold,
     dry_run,
     resume,
+    target_height,
+    target_width,
 ):
     """Relabel every box in a single image. Thread-safe w.r.t. class_map."""
     img_path = os.path.join(train_image, img_file)
@@ -170,6 +174,15 @@ def process_one_image(
         if crop_image.size == 0:
             print(f"Warning: empty crop in {img_file}, skipping box.")
             continue
+
+        # preprocess_custom_resize works on PIL.Image, not numpy arrays -
+        # round-trip through PIL and back so encode_crop_to_data_uri (which
+        # expects an RGB numpy array for cv2) still gets what it needs.
+        pil_crop = Image.fromarray(crop_image)
+        pil_crop, _ = preprocess_custom_resize(
+            pil_crop, target_height=target_height, target_width=target_width
+        )
+        crop_image = np.array(pil_crop)
 
         if dry_run:
             print(f"[dry run] {img_file}: would classify box at ({x}, {y}, {bw}, {bh}).")
@@ -230,6 +243,8 @@ def read_images_with_labels(
     resume=False,
     image_extensions=(".jpg", ".jpeg", ".png"),
     max_workers=1,
+    target_height=1024,
+    target_width=1024,
 ):
     """
     Re-label every bounding box in every image with a model-predicted class.
@@ -283,6 +298,8 @@ def read_images_with_labels(
                 conf_threshold,
                 dry_run,
                 resume,
+                target_height,
+                target_width,
             )
             if img is not None:
                 last_img = img
@@ -302,6 +319,8 @@ def read_images_with_labels(
                     conf_threshold,
                     dry_run,
                     resume,
+                    target_height,
+                    target_width,
                 ): img_file
                 for img_file in image_names
             }
@@ -330,7 +349,7 @@ def build_client(args):
     """--use_llama_model True -> local llama.cpp server. Otherwise -> external API."""
     if args.use_llama_model:
         llama_manager = init_llama_server(args)
-        client = OpenAI(base_url="http://localhost:8080/v1", api_key="")
+        client = OpenAI(base_url=f"http://localhost:{args.port}/v1", api_key="")
         return client, llama_manager
     else:
         client = OpenAI(base_url=args.base_url, api_key=args.api_key)
@@ -349,6 +368,47 @@ def parse_args():
         "--use_llama_model",
         action="store_true",
         help="Use a local llama.cpp server instead of an external API.",
+    )
+    parser.add_argument(
+        "--enable_thinking",
+        action="store_true",
+        help="Enable the model's thinking/reasoning mode on the local llama.cpp server "
+        "(--use_llama_model only). Off by default: faster and usually unnecessary for a "
+        "single classify-this-crop call.",
+    )
+    parser.add_argument(
+        "--use_mtp",
+        action="store_true",
+        default=True,
+        help="Enable draft-MTP speculative decoding on the local llama.cpp server "
+        "(--use_llama_model only). On by default for speed; pass --no_mtp to disable it "
+        "if you hit compatibility issues with a given model/build.",
+    )
+    parser.add_argument(
+        "--no_mtp",
+        action="store_false",
+        dest="use_mtp",
+        help="Disable draft-MTP speculative decoding (--use_llama_model only).",
+    )
+    parser.add_argument(
+        "--ctx_size",
+        type=int,
+        default=20000,
+        help="Context size for the local llama.cpp server (--use_llama_model only).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port for the local llama.cpp server (--use_llama_model only).",
+    )
+    parser.add_argument(
+        "--parallel_slots",
+        type=int,
+        default=1,
+        help="Number of parallel inference slots on the local llama.cpp server "
+        "(--use_llama_model only). If you raise this, --max_workers can be raised to match "
+        "so multiple images are in flight at once.",
     )
     parser.add_argument("--train_image", type=str, required=True, help="Path to the folder of training images.")
     parser.add_argument("--train_label", type=str, required=True, help="Path to the folder of YOLO training labels.")
@@ -402,6 +462,30 @@ def parse_args():
         "llama.cpp server with parallel_slots=1; raise it for a remote API that supports "
         "concurrent requests.",
     )
+    parser.add_argument(
+        "--image_min_tokens",
+        type=int,
+        default=1024,
+        help="Minimum number of tokens to use for image encoding.",
+    )
+    parser.add_argument(
+        "--image_max_tokens",
+        type=int,
+        default=4096,
+        help="Maximum number of tokens to use for image encoding.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=1024,
+        help="Height of the input image for the model.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="Width of the input image for the model.",
+    )
     return parser.parse_args()
 
 
@@ -420,6 +504,7 @@ if __name__ == "__main__":
         if ext.strip()
     )
 
+
     try:
         read_images_with_labels(
             args.train_image,
@@ -436,6 +521,8 @@ if __name__ == "__main__":
             resume=args.resume,
             image_extensions=image_extensions,
             max_workers=args.max_workers,
+            target_height=args.height,
+            target_width=args.width,
         )
     finally:
         if llama_manager is not None:

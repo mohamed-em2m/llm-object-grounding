@@ -1,492 +1,319 @@
-"""
-Relabel binary defect / no-defect YOLO annotations into multi-class defect
-labels (e.g. "cut", "spot", ...) using a vision-language model.
-
-Supports two backends:
-  --use_llama_model            -> spins up a local llama.cpp server (LlamaServerManager)
-  (default, no flag)           -> talks to an external OpenAI-compatible API via
-                                   --base_url / --api_key
-
-New class names discovered by the model are accumulated across the whole
-dataset (not reset per-image) and written back into --yaml_path at the end.
-"""
-
-import argparse
-import base64
-import json
 import os
-import random
+import subprocess
 import threading
+import time
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-
-import cv2
-import json_repair
-import yaml
-from openai import OpenAI
-
-from llama_server_manager import LlamaServerManager
 
 
-def init_llama_server(args):
-    llama_manager = LlamaServerManager(
-        model=args.model,
-        host="localhost",
-        port=args.port,
-        ctx_size=args.ctx_size,
-        parallel_slots=args.parallel_slots,
-        n_threads=-1,
-        gpu_layers=-1,
-        tensor_split="1,1",
-        main_gpu=0,
-        temp=0.4,
-        top_p=0.95,
-        top_k=64,
-        spec_type="draft-mtp" if args.use_mtp else "none",
-        spec_draft_n_max=4 if args.use_mtp else 0,
-        fa="auto",
-        enable_thinking=args.enable_thinking,
-        batch_size=1024,
-        ubatch_size=512,
-        kv_cache_type="q4_0",
-        image_min_tokens=1024,
-        image_max_tokens=4096,
-    )
-    llama_manager.start_llama_server()
-    llama_manager.server_ready_event.wait(timeout=120)
-    return llama_manager
+# ─── Llama Server Class ───────────────────────────────────────────────────────
+class LlamaServerManager:
+    # ─── Configuration & Initialization ───────────────────────────────────────
+    def __init__(
+        self,
+        model: str = "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL",
+        host: str = "0.0.0.0",
+        port: int = 8080,
+        ctx_size: int = 20000,
+        parallel_slots: int = 1,
+        n_threads: int = -1,
+        gpu_layers: int = -1,
+        tensor_split: str = "1,1",
+        main_gpu: int = 0,
+        temp: float = 0.4,
+        top_p: float = 0.95,
+        top_k: int = 64,
+        spec_type: str = "draft-mtp",
+        spec_draft_n_max: int = 4,
+        fa: str = "auto",
+        enable_thinking: bool = False,
+        batch_size: int = 1024,
+        ubatch_size: int = 512,
+        kv_cache_type: str = "q4_0",
+        image_min_tokens: int = 1024,
+        image_max_tokens: int = 4096,
+    ):
+        self.model = model
+        self.host = host
+        self.port = port
+        self.ctx_size = ctx_size
+        self.parallel_slots = parallel_slots
+        self.n_threads = n_threads
+        self.gpu_layers = gpu_layers
+        self.tensor_split = tensor_split
+        self.main_gpu = main_gpu
+        self.temp = temp
+        self.top_p = top_p
+        self.top_k = top_k
+        self.spec_type = spec_type
+        self.spec_draft_n_max = spec_draft_n_max
+        self.fa = fa
+        self.enable_thinking = enable_thinking
+        self.batch_size = max(batch_size, ubatch_size)
+        self.ubatch_size = ubatch_size
+        self.kv_cache_type = kv_cache_type
+        self.image_min_tokens = image_min_tokens
+        self.image_max_tokens = image_max_tokens
 
+        self.process = None
+        self.server_ready_event = threading.Event()
+        self.logs = []
+        self.log_lock = threading.Lock()
 
-def encode_crop_to_data_uri(crop_rgb):
-    """Encode an RGB numpy crop (as produced by cv2 after BGR2RGB) into a base64 JPEG data URI."""
-    crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
-    ok, buffer = cv2.imencode(".jpg", crop_bgr)
-    if not ok:
-        raise ValueError("Could not JPEG-encode crop.")
-    b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
+        # Resolve connection URL (use localhost if binding to all interfaces)
+        req_host = "localhost" if self.host == "0.0.0.0" else self.host
+        self.server_url = f"http://{req_host}:{self.port}"
 
+    # ─── Server Launcher ──────────────────────────────────────────────────────
+    def start_llama_server(self):
+        """
+        Spawns the llama-server subprocess and launches a daemon thread
+        to monitor stdout for the readiness signal.
+        """
+        if self.process is not None and self.process.poll() is None:
+            print("ℹ️ Server is already running.")
+            return
 
-def detect_defect(crop_image, client, model_name, known_class_names):
-    """
-    Ask the model to classify a cropped defect region.
+        cmd = [
+            "llama-server",
+            "-hf",
+            self.model,
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--ctx-size",
+            str(self.ctx_size),
+            "-ngl",
+            str(self.gpu_layers),
+            "--tensor-split",
+            self.tensor_split,
+            "--main-gpu",
+            str(self.main_gpu),
+            "--parallel",
+            str(self.parallel_slots),
+            "--threads",
+            str(self.n_threads),
+            "--temp",
+            str(self.temp),
+            "--top-p",
+            str(self.top_p),
+            "--top-k",
+            str(self.top_k),
+            "-fa",
+            self.fa,
+            "--chat-template-kwargs",
+            f'{{"enable_thinking": {str(self.enable_thinking).lower()}}}',
+            "--jinja",
+            "--image-min-tokens",
+            str(self.image_min_tokens),
+            "--image-max-tokens",
+            str(self.image_max_tokens),
+        ]
+        print("cmd: ", cmd)
+        # Dynamically append speculative drafting options
+        if self.spec_type and self.spec_type.lower() != "none":
+            cmd.extend(["--spec-type", self.spec_type])
+            if self.spec_draft_n_max is not None:
+                cmd.extend(["--spec-draft-n-max", str(self.spec_draft_n_max)])
 
-    known_class_names: list[str] of classes already known, so the model reuses
-    an existing name instead of inventing near-duplicates.
-
-    Returns dict like {"class": "spot", "confidence": 4}
-    """
-    data_uri = encode_crop_to_data_uri(crop_image)
-    prompt = (
-        "Classify the defect shown in this cropped image. "
-        f"The currently known defect classes are: {known_class_names}. "
-        'Respond with ONLY this JSON shape and nothing else: '
-        '{"class": "<class_name>", "confidence": <integer 1-5>}. '
-        "Reuse an existing class name if the defect matches one. "
-        "If it clearly doesn't match any existing class, invent a short, "
-        "lowercase, single-word class name for it. "
-        "Confidence is the severity/size of the defect: 1 = very small, "
-        "5 = very large (this scale applies whether it's a spot, a cut, or a new class)."
-    )
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                ],
-            }
-        ],
-    )
-    raw = response.choices[0].message.content
-    return json_repair.loads(raw)
-
-
-def load_or_init_class_map(names_from_yaml):
-    """Normalize yaml `names` (list or {id: name} dict) into a name -> id dict."""
-    class_map = {}
-    if isinstance(names_from_yaml, dict):
-        for idx, name in names_from_yaml.items():
-            class_map[name] = int(idx)
-    elif isinstance(names_from_yaml, list):
-        for idx, name in enumerate(names_from_yaml):
-            class_map[name] = idx
-    return class_map
-
-
-def process_one_image(
-    img_file,
-    train_image,
-    train_label,
-    output_folder,
-    class_map,
-    class_map_lock,
-    client,
-    model_name,
-    conf_threshold,
-    dry_run,
-    resume,
-):
-    """Relabel every box in a single image. Thread-safe w.r.t. class_map."""
-    img_path = os.path.join(train_image, img_file)
-    img_stem = Path(img_file).stem
-    label_path = os.path.join(train_label, img_stem + ".txt")
-    label_out_path = Path(output_folder) / (img_stem + ".txt")
-
-    if not os.path.exists(label_path):
-        return None
-
-    if resume and label_out_path.exists():
-        print(f"Skipping {img_file} (already relabeled, --resume).")
-        return None
-
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"Warning: could not read image {img_path}, skipping.")
-        return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    h, w, _ = img.shape
-
-    with open(label_path, "r") as f:
-        lines = f.readlines()
-
-    new_label_lines = []
-    low_confidence_records = []
-
-    for line in lines:
-        values = line.strip().split()
-        if len(values) != 5:
-            continue
-
-        _old_cls, x, y, bw, bh = map(float, values)
-        x1 = max(int((x - bw / 2) * w), 0)
-        y1 = max(int((y - bh / 2) * h), 0)
-        x2 = min(int((x + bw / 2) * w), w)
-        y2 = min(int((y + bh / 2) * h), h)
-
-        crop_image = img[y1:y2, x1:x2]
-        if crop_image.size == 0:
-            print(f"Warning: empty crop in {img_file}, skipping box.")
-            continue
-
-        if dry_run:
-            print(f"[dry run] {img_file}: would classify box at ({x}, {y}, {bw}, {bh}).")
-            continue
-
-        # class_map is read here for the prompt before we know if this call
-        # will add a new class, so a stale-but-safe snapshot is fine.
-        try:
-            result = detect_defect(crop_image, client, model_name, list(class_map.keys()))
-        except Exception as e:
-            print(f"Warning: model call failed for {img_file}: {e}")
-            continue
-
-        class_name = result.get("class")
-        confidence = result.get("confidence", 0)
-        if not class_name:
-            continue
-
-        with class_map_lock:
-            if class_name not in class_map:
-                class_map[class_name] = len(class_map)
-            new_cls_id = class_map[class_name]
-
-        new_label_lines.append(f"{new_cls_id} {x} {y} {bw} {bh}")
-
-        if confidence <= conf_threshold:
-            low_confidence_records.append(
-                {"class": class_name, "confidence": confidence, "bbox": [x, y, bw, bh]}
+        # Dynamically append optional configurations if provided
+        if self.batch_size is not None:
+            cmd.extend(["--batch-size", str(self.batch_size)])
+        if self.ubatch_size is not None:
+            cmd.extend(["--ubatch-size", str(self.ubatch_size)])
+        if self.kv_cache_type is not None:
+            cmd.extend(
+                [
+                    "--cache-type-k",
+                    self.kv_cache_type,
+                    "--cache-type-v",
+                    self.kv_cache_type,
+                ]
             )
+        if self.image_min_tokens is not None:
+            cmd.extend(["--image-min-tokens", str(self.image_min_tokens)])
+        if self.image_max_tokens is not None:
+            cmd.extend(["--image-max-tokens", str(self.image_max_tokens)])
 
-    if dry_run:
-        return img
+        self.server_ready_event.clear()
+        with self.log_lock:
+            self.logs = []
 
-    with open(label_out_path, "w") as f:
-        if new_label_lines:
-            f.write("\n".join(new_label_lines) + "\n")
-
-    if low_confidence_records:
-        debug_out_path = Path(output_folder) / (img_stem + "_low_confidence.json")
-        with open(debug_out_path, "w") as f:
-            json.dump(low_confidence_records, f, indent=4)
-
-    return img
-
-
-def read_images_with_labels(
-    train_image,
-    train_label,
-    class_map,
-    client,
-    model_name,
-    output_folder,
-    conf_threshold=2,
-    num_samples=None,
-    shuffle=False,
-    seed=42,
-    dry_run=False,
-    resume=False,
-    image_extensions=(".jpg", ".jpeg", ".png"),
-    max_workers=1,
-):
-    """
-    Re-label every bounding box in every image with a model-predicted class.
-
-    class_map is mutated in place and shared across all images (protected by a
-    lock when max_workers > 1), so a class discovered on image 3 is available
-    (and reused) for image 300.
-
-    num_samples: if set, only process this many images (great for quickly
-        sanity-checking a prompt change before a full run).
-    shuffle: shuffle image order (seeded) before applying num_samples, so a
-        "sample" isn't just the first N alphabetically.
-    dry_run: don't call the model and don't write any files, just print what
-        would happen for each image/box.
-    resume: skip images that already have an output label file, so an
-        interrupted run can be restarted without redoing work (and without
-        burning API calls again).
-    image_extensions: only files with these extensions are treated as images.
-    max_workers: number of images processed concurrently. Keep at 1 when using
-        a local llama.cpp server with parallel_slots=1.
-    """
-    os.makedirs(output_folder, exist_ok=True)
-    image_extensions = tuple(ext.lower() for ext in image_extensions)
-    image_names = sorted(
-        f for f in os.listdir(train_image) if f.lower().endswith(image_extensions)
-    )
-
-    if shuffle:
-        random.seed(seed)
-        random.shuffle(image_names)
-
-    if num_samples is not None:
-        image_names = image_names[:num_samples]
-
-    print(f"Processing {len(image_names)} image(s)" + (" [dry run]" if dry_run else "") + ".")
-
-    class_map_lock = threading.Lock()
-    last_img = None
-
-    if max_workers <= 1:
-        for img_file in image_names:
-            img = process_one_image(
-                img_file,
-                train_image,
-                train_label,
-                output_folder,
-                class_map,
-                class_map_lock,
-                client,
-                model_name,
-                conf_threshold,
-                dry_run,
-                resume,
-            )
-            if img is not None:
-                last_img = img
-    else:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    process_one_image,
-                    img_file,
-                    train_image,
-                    train_label,
-                    output_folder,
-                    class_map,
-                    class_map_lock,
-                    client,
-                    model_name,
-                    conf_threshold,
-                    dry_run,
-                    resume,
-                ): img_file
-                for img_file in image_names
-            }
-            for future in as_completed(futures):
-                img_file = futures[future]
-                try:
-                    img = future.result()
-                    if img is not None:
-                        last_img = img
-                except Exception as e:
-                    print(f"Warning: processing {img_file} raised an exception: {e}")
-
-    return last_img
-
-
-def save_updated_yaml(yaml_path, original_data, class_map):
-    updated = dict(original_data)
-    sorted_names = [name for name, _ in sorted(class_map.items(), key=lambda kv: kv[1])]
-    updated["names"] = sorted_names
-    updated["nc"] = len(sorted_names)
-    with open(yaml_path, "w") as f:
-        yaml.safe_dump(updated, f, sort_keys=False)
-
-
-def build_client(args):
-    """--use_llama_model True -> local llama.cpp server. Otherwise -> external API."""
-    if args.use_llama_model:
-        llama_manager = init_llama_server(args)
-        client = OpenAI(base_url=f"http://localhost:{args.port}/v1", api_key="")
-        return client, llama_manager
-    else:
-        client = OpenAI(base_url=args.base_url, api_key=args.api_key)
-        return client, None
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Relabel binary defect/no-defect YOLO annotations into multi-class defect labels using a VLM."
-    )
-    parser.add_argument("--output-folder", type=str, required=True, help="Where to save the relabeled output.")
-    parser.add_argument("--model", type=str, required=True, help="Model name to use for classification.")
-    parser.add_argument("--api_key", type=str, default="", help="API key for the external/hosted model.")
-    parser.add_argument("--base_url", type=str, default="", help="Base URL for the external/hosted model.")
-    parser.add_argument(
-        "--use_llama_model",
-        action="store_true",
-        help="Use a local llama.cpp server instead of an external API.",
-    )
-    parser.add_argument(
-        "--enable_thinking",
-        action="store_true",
-        help="Enable the model's thinking/reasoning mode on the local llama.cpp server "
-        "(--use_llama_model only). Off by default: faster and usually unnecessary for a "
-        "single classify-this-crop call.",
-    )
-    parser.add_argument(
-        "--use_mtp",
-        action="store_true",
-        default=True,
-        help="Enable draft-MTP speculative decoding on the local llama.cpp server "
-        "(--use_llama_model only). On by default for speed; pass --no_mtp to disable it "
-        "if you hit compatibility issues with a given model/build.",
-    )
-    parser.add_argument(
-        "--no_mtp",
-        action="store_false",
-        dest="use_mtp",
-        help="Disable draft-MTP speculative decoding (--use_llama_model only).",
-    )
-    parser.add_argument(
-        "--ctx_size",
-        type=int,
-        default=20000,
-        help="Context size for the local llama.cpp server (--use_llama_model only).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8080,
-        help="Port for the local llama.cpp server (--use_llama_model only).",
-    )
-    parser.add_argument(
-        "--parallel_slots",
-        type=int,
-        default=1,
-        help="Number of parallel inference slots on the local llama.cpp server "
-        "(--use_llama_model only). If you raise this, --max_workers can be raised to match "
-        "so multiple images are in flight at once.",
-    )
-    parser.add_argument("--train_image", type=str, required=True, help="Path to the folder of training images.")
-    parser.add_argument("--train_label", type=str, required=True, help="Path to the folder of YOLO training labels.")
-    parser.add_argument("--yaml_path", type=str, required=True, help="Path to the dataset yaml file (data.yaml).")
-    parser.add_argument(
-        "--conf_threshold",
-        type=int,
-        default=2,
-        help="Confidence (1-5) at/below which a box is ALSO logged to a *_low_confidence.json for manual review.",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=None,
-        help="Only process this many images (quick sanity-check run instead of the full dataset).",
-    )
-    parser.add_argument(
-        "--shuffle",
-        action="store_true",
-        help="Shuffle image order (seeded by --seed) before applying --num_samples, "
-        "so a sample isn't just the first N images alphabetically.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used when --shuffle is set, for reproducible samples.",
-    )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Don't call the model and don't write any files; just print what would happen.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip images that already have an output label file (resume an interrupted run "
-        "without re-spending API calls).",
-    )
-    parser.add_argument(
-        "--image_extensions",
-        type=str,
-        default=".jpg,.jpeg,.png",
-        help="Comma-separated list of image file extensions to process.",
-    )
-    parser.add_argument(
-        "--max_workers",
-        type=int,
-        default=1,
-        help="Number of images to process concurrently (thread pool). Keep at 1 for a local "
-        "llama.cpp server with parallel_slots=1; raise it for a remote API that supports "
-        "concurrent requests.",
-    )
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-
-    with open(args.yaml_path, "r") as f:
-        data = yaml.safe_load(f)
-
-    class_map = load_or_init_class_map(data.get("names", []))
-    client, llama_manager = build_client(args)
-
-    image_extensions = tuple(
-        ext.strip() if ext.strip().startswith(".") else f".{ext.strip()}"
-        for ext in args.image_extensions.split(",")
-        if ext.strip()
-    )
-
-    try:
-        read_images_with_labels(
-            args.train_image,
-            args.train_label,
-            class_map,
-            client,
-            args.model,
-            args.output_folder,
-            conf_threshold=args.conf_threshold,
-            num_samples=args.num_samples,
-            shuffle=args.shuffle,
-            seed=args.seed,
-            dry_run=args.dry_run,
-            resume=args.resume,
-            image_extensions=image_extensions,
-            max_workers=args.max_workers,
+        # Start the subprocess
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
-    finally:
-        if llama_manager is not None:
+
+        # Background reader thread to monitor server startup output
+        def monitor_output():
+            for line in self.process.stdout:
+                with self.log_lock:
+                    self.logs.append(line)
+                    if len(self.logs) > 2000:
+                        self.logs.pop(0)
+                print(line, end="", flush=True)
+                if (
+                    "HTTP server listening" in line
+                    or "server is listening" in line.lower()
+                ):
+                    self.server_ready_event.set()
+
+        monitor_thread = threading.Thread(target=monitor_output, daemon=True)
+        monitor_thread.start()
+
+    def get_logs(self) -> str:
+        """Return all captured logs so far as a single string."""
+        with self.log_lock:
+            return "".join(self.logs)
+
+    # ─── Wait for server ──────────────────────────────────────────────────────
+    def wait_for_server(self, timeout: int = 180):
+        """
+        Waits for the output event trigger and polls the health endpoint
+        until the server confirms it is fully loaded.
+        """
+        print("⏳ Waiting for llama-server...")
+        self.server_ready_event.wait(timeout=timeout)
+
+        deadline = time.time() + 60
+        while time.time() < deadline:
             try:
-                llama_manager.stop_llama_server()
+                r = requests.get(f"{self.server_url}/health", timeout=2)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("status") == "ok":
+                        print(f"✅ Server ready at {self.server_url}")
+                        return True
             except Exception:
                 pass
+            time.sleep(1)
 
-    if args.dry_run:
-        print("Dry run complete — no files were written, yaml was not updated.")
-    else:
-        save_updated_yaml(args.yaml_path, data, class_map)
-        print(f"Done. Final classes: {class_map}")
+        raise RuntimeError("❌ Server did not become healthy in time.")
+
+    # ─── Warmup Request ───────────────────────────────────────────────────────
+    def warmup_model(self, test_prompt: str = "explain what is qwen"):
+        """
+        Performs an initial run on the loaded model to initialize paths and KV caches.
+        """
+        try:
+            print("🔥 Warming up model...")
+            requests.post(
+                f"{self.server_url}/v1/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": test_prompt}],
+                    "max_tokens": 1,
+                    "stream": False,
+                },
+                timeout=60,
+            )
+            print("✅ Warmup done — TTFT will be faster for real requests")
+        except Exception as e:
+            print(f"⚠️  Warmup failed (non-fatal): {e}")
+
+    # ─── Shutdown ─────────────────────────────────────────────────────────────
+    def stop_llama_server(self, timeout: float = 5.0):
+        """
+        Terminates the llama-server process cleanly.
+
+        Attempts a graceful termination (SIGTERM) first to allow the system
+        to release GPU VRAM and resources, falling back to a forceful
+        kill (SIGKILL) if the process hangs.
+        """
+        if self.process is None:
+            print("⚠️ No active process provided to stop.")
+            return
+
+        # Check if process is already stopped
+        if self.process.poll() is not None:
+            print(
+                f"ℹ️ Server process has already stopped (Exit code: {self.process.poll()})"
+            )
+            self.process = None
+            return
+
+        print("🛑 Sending termination signal (SIGTERM)...")
+        try:
+            # Request a graceful exit (vital for GPU memory cleanup)
+            self.process.terminate()
+
+            # Wait to allow the process to finish cleaning up resources
+            self.process.wait(timeout=timeout)
+            print(f"✅ Server stopped cleanly. (Exit code: {self.process.returncode})")
+
+        except subprocess.TimeoutExpired:
+            print(
+                f"⚠️ Server did not exit within {timeout} seconds. Forcing shutdown (SIGKILL)..."
+            )
+            try:
+                self.process.kill()
+                self.process.wait()
+                print("✅ Server process forcefully terminated.")
+            except Exception as e:
+                print(f"❌ Failed to forcefully kill the process: {e}")
+
+        except Exception as e:
+            print(f"❌ An error occurred during termination: {e}")
+        finally:
+            self.process = None
+
+    # ─── Orchestrator / Entry Point ───────────────────────────────────────────
+    def run_pipeline(self):
+        """
+        Coordinates launching, waiting, and warming up the model.
+        """
+        # 1. Start the server
+        self.start_llama_server()
+
+        # 2. Wait until operational
+        self.wait_for_server()
+
+        # 3. Trigger warm up
+        self.warmup_model()
+
+    def is_healthy(self) -> bool:
+        """Check if the llama-server is running and responsive."""
+        if self.process is None or self.process.poll() is not None:
+            return False
+        try:
+            r = requests.get(f"{self.server_url}/health", timeout=1)
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("status") == "ok"
+        except Exception:
+            pass
+        return False
+
+    # ─── Context Manager ──────────────────────────────────────────────────────
+    def __enter__(self):
+        self.run_pipeline()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop_llama_server()
+
+
+# ─── Execution ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # Initialize the class with your custom configurations
+    server = LlamaServerManager(
+        model="unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL",
+        port=8080,
+        ctx_size=20000,
+        kv_cache_type="q4_0",
+    )
+
+    # Run the orchestration pipeline
+    server.run_pipeline()
+
+    # Keep main execution alive and manage cleanup cleanly
+    try:
+        server.process.wait()
+    except KeyboardInterrupt:
+        print("\nStopping server...")
+    finally:
+        server.stop_llama_server()
