@@ -80,15 +80,19 @@ def detect_defect(crop_image, client, model_name, known_class_names):
     """
     data_uri = encode_crop_to_data_uri(crop_image)
     prompt = (
-        "Classify the defect shown in this cropped image. "
-        f"The currently known defect classes are: {known_class_names}. "
-        'Respond with ONLY this JSON shape and nothing else: '
-        '{"class": "<class_name>", "confidence": <integer 1-5>}. '
-        "Reuse an existing class name if the defect matches one. "
-        "If it clearly doesn't match any existing class, invent a short, "
-        "lowercase, single-word class name for it. "
-        "Confidence is the severity/size of the defect: 1 = very small, "
-        "5 = very large (this scale applies whether it's a spot, a cut, or a new class)."
+        "You are an expert textile quality inspector. "
+        "Analyze the cropped fabric image and identify the primary visible defect. "
+        f"Existing defect classes: {known_class_names}. "
+        "First determine whether the defect matches one of the existing classes. "
+        "If it does, use the exact existing class name. "
+        "Only create a new class if the defect is clearly different from every existing class. "
+        "A new class name must be lowercase, a single word, concise, and descriptive. "
+        "Do not create synonyms or variations of existing classes. "
+        "Rate the defect severity based on its visible size and extent: "
+        "1 = very small, 2 = small, 3 = medium, 4 = large, 5 = very large. "
+        "Respond with ONLY valid JSON in exactly this format: "
+        '{"class":"<class_name>","confidence":<1-5>}. '
+        "Do not include explanations, markdown, extra text, comments, or additional fields."
     )
     response = client.chat.completions.create(
         model=model_name,
@@ -486,6 +490,11 @@ def parse_args():
         default=1024,
         help="Width of the input image for the model.",
     )
+    parser.add_argument(
+        "--init_class_map",
+        action="store_true",
+        help="Initialize the class map from the YAML file.",
+    )
     return parser.parse_args()
 
 
@@ -495,7 +504,7 @@ if __name__ == "__main__":
     with open(args.yaml_path, "r") as f:
         data = yaml.safe_load(f)
 
-    class_map = load_or_init_class_map(data.get("names", []))
+    class_map = load_or_init_class_map(data.get("names", [])) if args.init_class_map else {}
     client, llama_manager = build_client(args)
 
     image_extensions = tuple(
