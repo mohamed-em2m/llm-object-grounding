@@ -35,7 +35,7 @@ from image_preprocessing import preprocess_custom_resize
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(log_level="INFO", log_file=None):
+def setup_logging(log_level="DEBUG", log_file=None):
     """
     Configure logging once, at process start. Always logs to the console;
     additionally logs to --log_file if one is given, so a long unattended
@@ -62,7 +62,6 @@ def setup_logging(log_level="INFO", log_file=None):
     # Quiet down noisy third-party loggers (httpx/openai log every request at INFO).
     logging.getLogger("httpx").setLevel(max(level, logging.WARNING))
     logging.getLogger("httpcore").setLevel(max(level, logging.WARNING))
-
 
 class RunStats:
     """Thread-safe counters so a concurrent run can print an accurate summary."""
@@ -580,7 +579,7 @@ def parse_args():
     parser.add_argument(
         "--log_level",
         type=str,
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Set the logging level (default: INFO).",
     )
