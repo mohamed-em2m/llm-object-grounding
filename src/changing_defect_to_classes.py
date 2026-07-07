@@ -282,6 +282,7 @@ def process_one_image(
     target_height,
     target_width,
     stats,
+    inplace_saving
 ):
     """Relabel every box in a single image. Thread-safe w.r.t. class_map and stats."""
     img_path = os.path.join(train_image, img_file)
@@ -299,8 +300,11 @@ def process_one_image(
         return None
 
     logger.debug(f"{img_file}: label file has {len(lines)} line(s) -> {label_path}")
-    label_out_path = Path(output_folder) / (img_stem + ".txt")
-
+    if inplace_saving:
+        label_out_path = Path(train_label) / (img_stem + ".txt")
+    else: 
+        label_out_path = Path(output_folder) / (img_stem + ".txt")
+    
     if not os.path.exists(label_path):
         logger.warning(f"Label file not found for {img_file}: {label_path}")
         stats.incr("images_skipped_no_label")
@@ -520,6 +524,7 @@ def read_images_with_labels(
     target_height=1024,
     target_width=1024,
     stats=None,
+    inplace_saving=False
 ):
     """
     Re-label every bounding box in every image with a model-predicted class.
@@ -578,6 +583,7 @@ def read_images_with_labels(
                     target_height,
                     target_width,
                     stats,
+                    inplace_saving
                 )
                 if img is not None:
                     last_img = img
@@ -602,6 +608,7 @@ def read_images_with_labels(
                     target_height,
                     target_width,
                     stats,
+                    inplace_saving
                 ): img_file
                 for img_file in image_names
             }
@@ -788,6 +795,11 @@ def parse_args():
         action="store_true",
         help="Initialize the class map from the YAML file.",
     )
+    parser.add_argument(
+        "--inplace_saving",
+        action="store_true",
+        help="save inplace the relabeled annotations in the original label folder instead of a separate output folder.",
+    )
     return parser.parse_args()
 
 
@@ -839,6 +851,7 @@ if __name__ == "__main__":
             target_height=args.height,
             target_width=args.width,
             stats=stats,
+            inplace_saving=args.inplace_saving
         )
     except Exception as e:
         logger.exception(f"An unexpected error occurred during image processing: {e}")
