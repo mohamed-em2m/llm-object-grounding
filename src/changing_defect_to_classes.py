@@ -14,9 +14,11 @@ dataset (not reset per-image) and written back into --yaml_path at the end.
 import argparse
 import base64
 import json
+import logging
 import os
 import random
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -29,6 +31,96 @@ from PIL import Image
 
 from llama_server_manager import LlamaServerManager
 from image_preprocessing import preprocess_custom_resize
+
+logger = logging.getLogger("relabel_defects")
+
+
+def setup_logging(log_level="INFO", log_file=None):
+    """
+    Configure logging once, at process start. Always logs to the console;
+    additionally logs to --log_file if one is given, so a long unattended
+    run can be tailed / grepped / diffed after the fact.
+    """
+    level = getattr(logging, str(log_level).upper(), logging.INFO)
+    fmt = "%(asctime)s | %(levelname)-7s | %(threadName)-12s | %(message)s"
+    datefmt = "%H:%M:%S"
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.handlers.clear()  # avoid duplicate handlers if called more than once
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+    root.addHandler(console_handler)
+
+    if log_file:
+        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+        root.addHandler(file_handler)
+        logger.info(f"Logging to console and to file: {log_file}")
+
+    # Quiet down noisy third-party loggers (httpx/openai log every request at INFO).
+    logging.getLogger("httpx").setLevel(max(level, logging.WARNING))
+    logging.getLogger("httpcore").setLevel(max(level, logging.WARNING))
+
+
+class RunStats:
+    """Thread-safe counters so a concurrent run can print an accurate summary."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.images_total = 0
+        self.images_done = 0
+        self.images_skipped_no_label = 0
+        self.images_skipped_resume = 0
+        self.images_failed_read = 0
+        self.boxes_seen = 0
+        self.boxes_malformed_line = 0
+        self.boxes_empty_crop = 0
+        self.boxes_dry_run = 0
+        self.boxes_model_call_failed = 0
+        self.boxes_bad_response = 0
+        self.boxes_classified = 0
+        self.boxes_low_confidence = 0
+        self.classes_discovered = []
+
+    def incr(self, field, n=1):
+        with self._lock:
+            setattr(self, field, getattr(self, field) + n)
+
+    def note_new_class(self, class_name):
+        with self._lock:
+            self.classes_discovered.append(class_name)
+
+    def log_progress(self, img_file):
+        with self._lock:
+            self.images_done += 1
+            done, total = self.images_done, self.images_total
+        logger.info(f"[{done}/{total}] finished {img_file}")
+
+    def summary_lines(self):
+        lines = [
+            "===== Run summary =====",
+            f"Images: {self.images_total} total | "
+            f"{self.images_done} processed | "
+            f"{self.images_skipped_resume} skipped (--resume) | "
+            f"{self.images_skipped_no_label} skipped (no label file) | "
+            f"{self.images_failed_read} failed to read",
+            f"Boxes: {self.boxes_seen} seen | "
+            f"{self.boxes_classified} classified | "
+            f"{self.boxes_malformed_line} malformed label lines | "
+            f"{self.boxes_empty_crop} empty crops | "
+            f"{self.boxes_dry_run} dry-run (not sent to model)",
+            f"Model issues: {self.boxes_model_call_failed} call failures | "
+            f"{self.boxes_bad_response} unusable responses",
+            f"Low confidence boxes flagged for review: {self.boxes_low_confidence}",
+        ]
+        if self.classes_discovered:
+            lines.append(f"New classes discovered this run: {self.classes_discovered}")
+        else:
+            lines.append("New classes discovered this run: none")
+        return lines
+
 
 def init_llama_server(args):
     llama_manager = LlamaServerManager(
