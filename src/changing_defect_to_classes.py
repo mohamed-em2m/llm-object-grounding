@@ -219,7 +219,7 @@ def detect_defect(crop_image, client, model_name, known_class_names):
     prompt = (
         "You are an expert textile quality inspector. "
         "Analyze the cropped fabric image and identify the primary visible defect. "
-        f"Existing defect classes: {known_class_names}. "
+        f"Existing defect classes: {known_class_names}. this classes created by the others runned llm before you so you feel free to create another class. "
         "First determine whether the defect matches one of the existing classes. "
         "If it does, use the exact existing class name. "
         "Only create a new class if the defect is clearly different from every existing class. "
@@ -228,7 +228,7 @@ def detect_defect(crop_image, client, model_name, known_class_names):
         "Rate the defect severity based on its visible size and extent: "
         "1 = very small, 2 = small, 3 = medium, 4 = large, 5 = very large. "
         "Respond with ONLY valid JSON in exactly this format: "
-        '{"class":"<class_name>","confidence":<1-5>}. '
+        '{"reasoning":"<reasoning>","class":"<class_name>","confidence":<1-5>}. '
         "Do not include explanations, markdown, extra text, comments, or additional fields."
     )
     response = client.chat.completions.create(
