@@ -109,6 +109,7 @@ class LlamaServerManager:
             str(self.image_min_tokens),
             "--image-max-tokens",
             str(self.image_max_tokens),
+            "--log-disable"
         ]
         print("cmd: ", cmd)
         # Dynamically append speculative drafting options

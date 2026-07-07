@@ -251,7 +251,7 @@ def detect_defect(crop_image, client, model_name, known_class_names):
         raise ValueError("Model returned an empty text content response.")
         
     output = json_repair.loads(raw)
-    logger.debug(f"Model response: {output}")
+    logger.info(f"Model response: {output}")
     return output
 
 
