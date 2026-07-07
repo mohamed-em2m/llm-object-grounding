@@ -285,7 +285,19 @@ def process_one_image(
     """Relabel every box in a single image. Thread-safe w.r.t. class_map and stats."""
     img_path = os.path.join(train_image, img_file)
     img_stem = Path(img_file).stem
+
     label_path = os.path.join(train_label, img_stem + ".txt")
+    
+    try:
+        with open(label_path, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        logger.error(f"Failed to read label file {label_path}: {e}")
+        stats.incr("images_failed_read")
+        stats.log_progress(img_file)
+        return None
+
+    logger.debug(f"{img_file}: label file has {len(lines)} line(s) -> {label_path}")
     label_out_path = Path(output_folder) / (img_stem + ".txt")
 
     if not os.path.exists(label_path):
