@@ -32,7 +32,7 @@ from PIL import Image
 from llama_server_manager import LlamaServerManager
 from image_preprocessing import preprocess_custom_resize
 
-logger = logging.getLogger("relabel_defects")
+logger = logging.getLogger(__name__)
 
 
 def setup_logging(log_level="INFO", log_file=None):
@@ -228,36 +228,49 @@ def process_one_image(
     resume,
     target_height,
     target_width,
+    stats,
 ):
-    """Relabel every box in a single image. Thread-safe w.r.t. class_map."""
+    """Relabel every box in a single image. Thread-safe w.r.t. class_map and stats."""
     img_path = os.path.join(train_image, img_file)
     img_stem = Path(img_file).stem
     label_path = os.path.join(train_label, img_stem + ".txt")
     label_out_path = Path(output_folder) / (img_stem + ".txt")
 
     if not os.path.exists(label_path):
+        logger.warning(f"Label file not found for {img_file}: {label_path}")
+        stats.incr("images_skipped_no_label")
         return None
 
     if resume and label_out_path.exists():
-        print(f"Skipping {img_file} (already relabeled, --resume).")
+        logger.info(f"Skipping {img_file} (already relabeled, --resume).")
+        stats.incr("images_skipped_resume")
         return None
 
     img = cv2.imread(img_path)
     if img is None:
-        print(f"Warning: could not read image {img_path}, skipping.")
+        logger.error(f"Could not read image {img_path}, skipping.")
+        stats.incr("images_failed_read")
         return None
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     h, w, _ = img.shape
 
-    with open(label_path, "r") as f:
-        lines = f.readlines()
+    try:
+        with open(label_path, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        logger.error(f"Failed to read label file {label_path}: {e}")
+        stats.incr("images_failed_read")
+        return None
 
     new_label_lines = []
     low_confidence_records = []
 
     for line in lines:
+        stats.incr("boxes_seen")
         values = line.strip().split()
         if len(values) != 5:
+            logger.warning(f"Malformed label line in {label_path}: '{line.strip()}'")
+            stats.incr("boxes_malformed_line")
             continue
 
         _old_cls, x, y, bw, bh = map(float, values)
@@ -268,55 +281,67 @@ def process_one_image(
 
         crop_image = img[y1:y2, x1:x2]
         if crop_image.size == 0:
-            print(f"Warning: empty crop in {img_file}, skipping box.")
+            logger.warning(f"Empty crop in {img_file} for box ({x}, {y}, {bw}, {bh}), skipping box.")
+            stats.incr("boxes_empty_crop")
             continue
 
         if dry_run:
-            print(f"[dry run] {img_file}: would classify box at ({x}, {y}, {bw}, {bh}).")
+            logger.info(f"[dry run] {img_file}: would classify box at ({x}, {y}, {bw}, {bh}).")
+            stats.incr("boxes_dry_run")
             continue
 
         # preprocess_custom_resize works on PIL.Image, not numpy arrays -
-        # round-trip through PIL and back so encode_crop_to_data_uri (which
-        # expects an RGB numpy array for cv2) still gets what it needs.
+        # round-trip through PIL and back so encode_crop_to_data_uri still gets what it needs.
         pil_crop = Image.fromarray(crop_image)
-        pil_crop, _ = preprocess_custom_resize(
-            pil_crop, target_height=target_height, target_width=target_width
-        )
-        crop_image = np.array(pil_crop)
+        try:
+            pil_crop, _ = preprocess_custom_resize(
+                pil_crop, target_height=target_height, target_width=target_width
+            )
+            crop_image = np.array(pil_crop)
+        except Exception as e:
+            logger.error(f"Error preprocessing crop in {img_file}: {e}")
+            stats.incr("boxes_empty_crop")
+            continue
 
         # class_map is read here for the prompt before we know if this call
         # will add a new class. Take the snapshot under the lock so a
         # concurrent writer (another thread inserting a new class) can't
-        # mutate the dict mid-iteration and blow up list(...).
+        # mutate the dict mid-iteration.
         with class_map_lock:
             known_names = list(class_map.keys())
 
         try:
             result = detect_defect(crop_image, client, model_name, known_names)
         except Exception as e:
-            print(f"Warning: model call failed for {img_file}: {e}")
+            logger.error(f"Model call failed for {img_file}: {e}")
+            stats.incr("boxes_model_call_failed")
             continue
 
         if not isinstance(result, dict):
-            print(
-                f"Warning: unexpected (non-dict) model response for {img_file}: "
+            logger.warning(
+                f"Unexpected (non-dict) model response for {img_file}: "
                 f"{result!r}, skipping box."
             )
+            stats.incr("boxes_bad_response")
             continue
 
         class_name = result.get("class")
         if not class_name or not isinstance(class_name, str):
+            logger.warning(f"Invalid or missing class name in response for {img_file}: {result}")
+            stats.incr("boxes_bad_response")
             continue
         class_name = class_name.strip().lower()
         if not class_name:
+            logger.warning(f"Empty class name in response for {img_file}: {result}")
+            stats.incr("boxes_bad_response")
             continue
 
         raw_confidence = result.get("confidence", 0)
         try:
             confidence = int(raw_confidence)
         except (TypeError, ValueError):
-            print(
-                f"Warning: non-numeric confidence {raw_confidence!r} for {img_file}, "
+            logger.warning(
+                f"Non-numeric confidence {raw_confidence!r} for {img_file}, "
                 "defaulting to 0."
             )
             confidence = 0
@@ -324,27 +349,38 @@ def process_one_image(
         with class_map_lock:
             if class_name not in class_map:
                 class_map[class_name] = len(class_map)
+                stats.note_new_class(class_name)
             new_cls_id = class_map[class_name]
 
         new_label_lines.append(f"{new_cls_id} {x} {y} {bw} {bh}")
+        stats.incr("boxes_classified")
 
         if confidence <= conf_threshold:
+            stats.incr("boxes_low_confidence")
             low_confidence_records.append(
                 {"class": class_name, "confidence": confidence, "bbox": [x, y, bw, bh]}
             )
 
     if dry_run:
+        stats.log_progress(img_file)
         return img
 
-    with open(label_out_path, "w") as f:
-        if new_label_lines:
-            f.write("\n".join(new_label_lines) + "\n")
+    try:
+        with open(label_out_path, "w") as f:
+            if new_label_lines:
+                f.write("\n".join(new_label_lines) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write relabeled annotations to {label_out_path}: {e}")
 
     if low_confidence_records:
         debug_out_path = Path(output_folder) / (img_stem + "_low_confidence.json")
-        with open(debug_out_path, "w") as f:
-            json.dump(low_confidence_records, f, indent=4)
+        try:
+            with open(debug_out_path, "w") as f:
+                json.dump(low_confidence_records, f, indent=4)
+        except Exception as e:
+            logger.error(f"Failed to write low confidence records to {debug_out_path}: {e}")
 
+    stats.log_progress(img_file)
     return img
 
 
@@ -365,6 +401,7 @@ def read_images_with_labels(
     max_workers=1,
     target_height=1024,
     target_width=1024,
+    stats=None,
 ):
     """
     Re-label every bounding box in every image with a model-predicted class.
@@ -372,20 +409,10 @@ def read_images_with_labels(
     class_map is mutated in place and shared across all images (protected by a
     lock when max_workers > 1), so a class discovered on image 3 is available
     (and reused) for image 300.
-
-    num_samples: if set, only process this many images (great for quickly
-        sanity-checking a prompt change before a full run).
-    shuffle: shuffle image order (seeded) before applying num_samples, so a
-        "sample" isn't just the first N alphabetically.
-    dry_run: don't call the model and don't write any files, just print what
-        would happen for each image/box.
-    resume: skip images that already have an output label file, so an
-        interrupted run can be restarted without redoing work (and without
-        burning API calls again).
-    image_extensions: only files with these extensions are treated as images.
-    max_workers: number of images processed concurrently. Keep at 1 when using
-        a local llama.cpp server with parallel_slots=1.
     """
+    if stats is None:
+        stats = RunStats()
+
     os.makedirs(output_folder, exist_ok=True)
     image_extensions = tuple(ext.lower() for ext in image_extensions)
     image_names = sorted(
@@ -399,30 +426,35 @@ def read_images_with_labels(
     if num_samples is not None:
         image_names = image_names[:num_samples]
 
-    print(f"Processing {len(image_names)} image(s)" + (" [dry run]" if dry_run else "") + ".")
+    stats.images_total = len(image_names)
+    logger.info(f"Processing {len(image_names)} image(s)" + (" [dry run]" if dry_run else "") + ".")
 
     class_map_lock = threading.Lock()
     last_img = None
 
     if max_workers <= 1:
         for img_file in image_names:
-            img = process_one_image(
-                img_file,
-                train_image,
-                train_label,
-                output_folder,
-                class_map,
-                class_map_lock,
-                client,
-                model_name,
-                conf_threshold,
-                dry_run,
-                resume,
-                target_height,
-                target_width,
-            )
-            if img is not None:
-                last_img = img
+            try:
+                img = process_one_image(
+                    img_file,
+                    train_image,
+                    train_label,
+                    output_folder,
+                    class_map,
+                    class_map_lock,
+                    client,
+                    model_name,
+                    conf_threshold,
+                    dry_run,
+                    resume,
+                    target_height,
+                    target_width,
+                    stats,
+                )
+                if img is not None:
+                    last_img = img
+            except Exception as e:
+                logger.exception(f"Unexpected error processing {img_file}: {e}")
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -441,6 +473,7 @@ def read_images_with_labels(
                     resume,
                     target_height,
                     target_width,
+                    stats,
                 ): img_file
                 for img_file in image_names
             }
@@ -451,7 +484,7 @@ def read_images_with_labels(
                     if img is not None:
                         last_img = img
                 except Exception as e:
-                    print(f"Warning: processing {img_file} raised an exception: {e}")
+                    logger.exception(f"Processing {img_file} raised an exception: {e}")
 
     return last_img
 
@@ -479,6 +512,20 @@ def build_client(args):
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Relabel binary defect/no-defect YOLO annotations into multi-class defect labels using a VLM."
+    )
+    # Logging Configuration
+    parser.add_argument(
+        "--log_level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO).",
+    )
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        default=None,
+        help="Optional path to a file where logs should also be written.",
     )
     parser.add_argument("--output-folder", type=str, required=True, help="Where to save the relabeled output.")
     parser.add_argument("--model", type=str, required=True, help="Model name to use for classification.")
@@ -616,12 +663,24 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    setup_logging(log_level=args.log_level, log_file=args.log_file)
 
-    with open(args.yaml_path, "r") as f:
-        data = yaml.safe_load(f)
+    try:
+        with open(args.yaml_path, "r") as f:
+            data = yaml.safe_load(f)
+    except Exception as e:
+        logger.error(f"Failed to read dataset yaml file at {args.yaml_path}: {e}")
+        exit(1)
 
     class_map = load_or_init_class_map(data.get("names", [])) if args.init_class_map else {}
-    client, llama_manager = build_client(args)
+    
+    client = None
+    llama_manager = None
+    try:
+        client, llama_manager = build_client(args)
+    except Exception as e:
+        logger.error(f"Failed to initialize server or client: {e}")
+        exit(1)
 
     image_extensions = tuple(
         ext.strip() if ext.strip().startswith(".") else f".{ext.strip()}"
@@ -629,6 +688,7 @@ if __name__ == "__main__":
         if ext.strip()
     )
 
+    stats = RunStats()
 
     try:
         read_images_with_labels(
@@ -648,16 +708,27 @@ if __name__ == "__main__":
             max_workers=args.max_workers,
             target_height=args.height,
             target_width=args.width,
+            stats=stats,
         )
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during image processing: {e}")
     finally:
         if llama_manager is not None:
+            logger.info("Stopping local llama.cpp server...")
             try:
                 llama_manager.stop_llama_server()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error occurred while stopping local server: {e}")
+
+    # Output detailed runtime metrics through configured logger channels
+    for line in stats.summary_lines():
+        logger.info(line)
 
     if args.dry_run:
-        print("Dry run complete — no files were written, yaml was not updated.")
+        logger.info("Dry run complete — no files were written, yaml was not updated.")
     else:
-        save_updated_yaml(args.yaml_path, data, class_map)
-        print(f"Done. Final classes: {class_map}")
+        try:
+            save_updated_yaml(args.yaml_path, data, class_map)
+            logger.info(f"Done. Final classes: {class_map}")
+        except Exception as e:
+            logger.error(f"Failed to save updated dataset yaml file: {e}")
