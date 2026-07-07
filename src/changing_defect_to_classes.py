@@ -349,7 +349,7 @@ def build_client(args):
     """--use_llama_model True -> local llama.cpp server. Otherwise -> external API."""
     if args.use_llama_model:
         llama_manager = init_llama_server(args)
-        client = OpenAI(base_url=f"http://localhost:{args.port}/v1", api_key="")
+        client = OpenAI(base_url=f"http://localhost:{args.port}/v1", api_key="not-needed")
         return client, llama_manager
     else:
         client = OpenAI(base_url=args.base_url, api_key=args.api_key)
