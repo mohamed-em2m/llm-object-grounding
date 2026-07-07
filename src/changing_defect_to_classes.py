@@ -450,6 +450,56 @@ def process_one_image(
     stats.log_progress(img_file)
     return img
 
+def find_labeled_images(train_image, train_label, image_extensions):
+    """
+    Walk the labels folder (not the images folder) and keep only label files
+    that have at least one non-blank line, then resolve each to its matching
+    image file. Returns a sorted list of image filenames.
+
+    This is the source of truth for "has something to process" -- an image
+    whose label file is empty or missing is never a candidate, even before
+    --num_samples / --shuffle are applied.
+    """
+    image_names = []
+    skipped_empty = 0
+    skipped_no_image = 0
+
+    label_files = sorted(f for f in os.listdir(train_label) if f.lower().endswith(".txt"))
+
+    for label_file in label_files:
+        label_path = os.path.join(train_label, label_file)
+        try:
+            with open(label_path, "r") as f:
+                lines = [ln for ln in f.readlines() if ln.strip()]
+        except Exception as e:
+            logger.error(f"Failed to read label file {label_path}: {e}")
+            continue
+
+        if not lines:
+            skipped_empty += 1
+            continue
+
+        stem = Path(label_file).stem
+        matched_image = None
+        for ext in image_extensions:
+            candidate = stem + ext
+            if os.path.exists(os.path.join(train_image, candidate)):
+                matched_image = candidate
+                break
+
+        if matched_image is None:
+            logger.warning(f"No matching image for label '{label_file}' in {train_image}")
+            skipped_no_image += 1
+            continue
+
+        image_names.append(matched_image)
+
+    logger.info(
+        f"Found {len(image_names)} image(s) with non-empty labels "
+        f"({skipped_empty} label file(s) empty, {skipped_no_image} with no matching image)."
+    )
+    return sorted(image_names)
+
 
 def read_images_with_labels(
     train_image,
@@ -482,12 +532,18 @@ def read_images_with_labels(
 
     os.makedirs(output_folder, exist_ok=True)
     image_extensions = tuple(ext.lower() for ext in image_extensions)
-    image_names = sorted(
-        f for f in os.listdir(train_image) if f.lower().endswith(image_extensions)
-    )
+
+    # Read the labels folder first, and only keep images whose label file
+    # actually has lines to process. --num_samples / --shuffle are applied
+    # AFTER this filter, so a requested sample size is filled with real work
+    # instead of images that have nothing to classify.
+    image_names = find_labeled_images(train_image, train_label, image_extensions)
 
     if not image_names:
-        logger.warning(f"No images found in '{train_image}' with extensions: {image_extensions}")
+        logger.warning(
+            f"No images with non-empty label files found (labels: '{train_label}', "
+            f"images: '{train_image}', extensions: {image_extensions})."
+        )
         return None
 
     if shuffle:
@@ -558,7 +614,6 @@ def read_images_with_labels(
                     logger.exception(f"Processing {img_file} raised an exception: {e}")
 
     return last_img
-
 
 def save_updated_yaml(yaml_path, original_data, class_map):
     if not class_map:
