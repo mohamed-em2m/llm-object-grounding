@@ -189,7 +189,7 @@ def init_llama_server(args):
     llama_manager.start_llama_server()
     
     # Active HTTP polling replaces the static event wait logic
-    server_ready = wait_for_server_health(args.port, timeout=120)
+    server_ready = wait_for_server_health(args.port, timeout=1200)
     if not server_ready:
         logger.warning("Proceeding, but server health checks did not pass successfully.")
         
