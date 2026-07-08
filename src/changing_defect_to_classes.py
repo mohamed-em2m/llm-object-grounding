@@ -347,10 +347,16 @@ def process_one_image(
             continue
 
         _old_cls, x, y, bw, bh = map(float, values)
-        x1 = max(int((x - bw / 2) * w), 0)
-        y1 = max(int((y - bh / 2) * h), 0)
-        x2 = min(int((x + bw / 2) * w), w)
-        y2 = min(int((y + bh / 2) * h), h)
+        _old_cls, x, y, bw, bh = map(float, values)
+
+        x1 = max(0, min(w, round((x - bw / 2) * w)))
+        y1 = max(0, min(h, round((y - bh / 2) * h)))
+        x2 = max(0, min(w, round((x + bw / 2) * w)))
+        y2 = max(0, min(h, round((y + bh / 2) * h)))
+
+        if x2 <= x1 or y2 <= y1:
+            logger.warning(f"Invalid box in {img_file}: {values}")
+            continue
 
         crop_image = img[y1:y2, x1:x2]
         if crop_image.size == 0:
