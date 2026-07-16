@@ -283,9 +283,9 @@ def init_llama_server(args):
         gpu_layers=-1,
         tensor_split="1,1",
         main_gpu=0,
-        temp=0.4,
-        top_p=0.95,
-        top_k=64,
+        temp=0.1,
+        top_p=0.85,
+        top_k=24,
         spec_type="draft-mtp" if args.use_mtp else "none",
         spec_draft_n_max=4 if args.use_mtp else 0,
         fa="auto",
@@ -901,7 +901,7 @@ def read_images_with_labels(
     return last_img
 
 
-def save_updated_yaml(yaml_path, original_data, class_map):
+def save_updated_yaml(yaml_path, output_folder, original_data, class_map):
     if not class_map:
         logger.warning(
             "Class map is empty. Skipping YAML update to prevent erasing existing names."
@@ -912,6 +912,8 @@ def save_updated_yaml(yaml_path, original_data, class_map):
     updated["names"] = sorted_names
     updated["nc"] = len(sorted_names)
     with open(yaml_path, "w") as f:
+        yaml.safe_dump(updated, f, sort_keys=False)
+    with open(output_folder / "data.yaml", "w") as f:
         yaml.safe_dump(updated, f, sort_keys=False)
 
 
@@ -1285,7 +1287,7 @@ if __name__ == "__main__":
         logger.info("Dry run complete — no files were written, yaml was not updated.")
     else:
         try:
-            save_updated_yaml(args.yaml_path, data, class_map)
+            save_updated_yaml(args.yaml_path, args.output_folder, data, class_map)
             logger.info(f"Done. Final classes: {class_map}")
         except Exception as e:
             logger.error(f"Failed to save updated dataset yaml file: {e}")
