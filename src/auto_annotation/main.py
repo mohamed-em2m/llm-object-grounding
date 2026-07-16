@@ -137,3 +137,7 @@ def main():
             logger.info(f"Done. Final classes: {class_map}")
         except Exception as e:
             logger.error(f"Failed to save updated dataset yaml file: {e}")
+
+
+if __name__ == "__main__":
+    main()
