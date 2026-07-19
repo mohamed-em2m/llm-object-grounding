@@ -1,7 +1,7 @@
 """Write the updated dataset yaml back to disk."""
 
 import yaml
-
+from pathlib import Path
 from auto_annotation.logging_utils import logger
 
 
@@ -18,5 +18,5 @@ def save_updated_yaml(yaml_path, output_folder, original_data, class_map):
     with open(yaml_path, "w") as f:
         yaml.safe_dump(updated, f, sort_keys=False)
 
-    with open(output_folder / "data.yaml", "w") as f:
+    with open(Path(output_folder) / "data.yaml", "w") as f:
         yaml.safe_dump(updated, f, sort_keys=False)
