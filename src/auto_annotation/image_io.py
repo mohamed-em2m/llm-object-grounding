@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import json_repair
 
-from .logging_utils import logger
+from auto_annotation.logging_utils import logger
 
 
 def encode_crop_to_data_uri(crop_rgb):

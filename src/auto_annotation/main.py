@@ -86,6 +86,9 @@ def main():
 
     stats = RunStats()
 
+    def auto_save():
+        save_updated_yaml(args.yaml_path, args.output_folder, data, class_map)
+
     try:
         read_images_with_labels(
             args.train_image,
@@ -112,6 +115,7 @@ def main():
             checkpoint=checkpoint,
             completed_images=completed_images,
             batches_done=batches_done,
+            auto_save=auto_save,
         )
     except Exception as e:
         logger.exception(f"An unexpected error occurred during image processing: {e}")
@@ -134,6 +138,7 @@ def main():
     else:
         try:
             save_updated_yaml(args.yaml_path, args.output_folder, data, class_map)
+
             logger.info(f"Done. Final classes: {class_map}")
         except Exception as e:
             logger.error(f"Failed to save updated dataset yaml file: {e}")

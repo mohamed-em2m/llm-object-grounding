@@ -41,7 +41,7 @@ from detection_pipeline import (
     DEFAULT_DETECTOR_TEMPLATE,
     DEFAULT_JUDGE_TEMPLATE,
 )
-from llama_server_manager import LlamaServerManager
+from servers import LlamaServerManager
 
 _iface_dir = os.path.join(os.path.dirname(__file__), "interface")
 

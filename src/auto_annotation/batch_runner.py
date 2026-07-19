@@ -15,6 +15,7 @@ from auto_annotation.logging_utils import logger
 from auto_annotation.stats import RunStats
 from auto_annotation.image_io import find_labeled_images, chunk_list
 from auto_annotation.single_image import process_one_image
+from auto_annotation.yaml_utils import save_updated_yaml
 
 
 def read_images_with_labels(
@@ -42,6 +43,7 @@ def read_images_with_labels(
     checkpoint=None,
     completed_images=None,
     batches_done=None,
+    auto_save=None,
 ):
     """
     Re-label every bounding box in every image with a model-predicted class.
@@ -168,6 +170,9 @@ def read_images_with_labels(
                     )
                     if img is not None:
                         last_img = img
+                    if not dry_run:
+                        auto_save()
+
                 except Exception as e:
                     logger.exception(f"Unexpected error processing {img_file}: {e}")
         else:
@@ -207,6 +212,8 @@ def read_images_with_labels(
                         logger.exception(
                             f"Processing {img_file} raised an exception: {e}"
                         )
+                if not dry_run:
+                    auto_save()
 
         # Whole batch finished (every image in it either processed just now
         # or already marked completed earlier) -> record it so a resumed run

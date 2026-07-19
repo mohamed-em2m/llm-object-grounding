@@ -246,7 +246,7 @@ def parse_args():
     parser.add_argument(
         "--max_num_seqs",
         type=int,
-        default=16,
+        default=2,
         help="vLLM maximum number of sequences.",
     )
     parser.add_argument(

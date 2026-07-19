@@ -17,5 +17,6 @@ def save_updated_yaml(yaml_path, output_folder, original_data, class_map):
     updated["nc"] = len(sorted_names)
     with open(yaml_path, "w") as f:
         yaml.safe_dump(updated, f, sort_keys=False)
+
     with open(output_folder / "data.yaml", "w") as f:
         yaml.safe_dump(updated, f, sort_keys=False)
