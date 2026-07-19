@@ -16,6 +16,7 @@ from auto_annotation.stats import RunStats
 from auto_annotation.image_io import find_labeled_images, chunk_list
 from auto_annotation.single_image import process_one_image
 from auto_annotation.yaml_utils import save_updated_yaml
+from pathlib import Path
 
 
 def read_images_with_labels(
@@ -68,8 +69,10 @@ def read_images_with_labels(
         completed_images = set()
     if batches_done is None:
         batches_done = set()
+    labels_folder = Path(output_folder) / "labels"
 
     os.makedirs(output_folder, exist_ok=True)
+    os.makedirs(labels_folder, exist_ok=True)
     image_extensions = tuple(ext.lower() for ext in image_extensions)
 
     # Read the labels folder first, and only keep images whose label file
@@ -135,9 +138,9 @@ def read_images_with_labels(
             continue
 
         if inplace_saving or batch_size <= 0:
-            batch_output_folder = output_folder
+            batch_output_folder = labels_folder
         else:
-            batch_output_folder = os.path.join(output_folder, f"batch_{batch_idx:04d}")
+            batch_output_folder = os.path.join(labels_folder, f"batch_{batch_idx:04d}")
             os.makedirs(batch_output_folder, exist_ok=True)
 
         logger.info(
