@@ -14,10 +14,16 @@ from auto_annotation.server_init import build_client
 from auto_annotation.batch_runner import read_images_with_labels
 from auto_annotation.yaml_utils import save_updated_yaml
 from auto_annotation.cli import parse_args
+from models import Args
 
 
-def main():
-    args = parse_args()
+def main(args: Args = None):
+
+    if args is None:
+        args = parse_args()
+    else:
+        args = args.to_dict()
+
     setup_logging(log_level=args.log_level, log_file=args.log_file)
 
     try:

@@ -10,7 +10,6 @@ import os
 import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from auto_annotation.logging_utils import logger
 from auto_annotation.stats import RunStats
 from auto_annotation.image_io import find_labeled_images, chunk_list

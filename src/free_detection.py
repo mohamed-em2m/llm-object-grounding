@@ -27,6 +27,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from detection_pipeline import ObjectDetectionPipeline
+from models import Args
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,7 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- Images ---
     p.add_argument(
-        "--image", "-i",
+        "--image",
+        "-i",
         metavar="PATH",
         action="append",
         required=True,
@@ -48,13 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- Categories ---
     p.add_argument(
-        "--categories", "-c",
+        "--categories",
+        "-c",
         metavar="LIST",
         default="person, car, bicycle, dog, cat",
         help="Comma-separated list of object categories to detect.",
     )
     p.add_argument(
-        "--definitions", "-d",
+        "--definitions",
+        "-d",
         metavar="TEXT",
         default="",
         help="Optional category definitions (plain text, one per line).",
@@ -137,37 +141,134 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # --- Preprocessing ---
-    p.add_argument("--prep-enabled", action="store_true", help="Enable image preprocessing.")
-    p.add_argument("--prep-short-edge", type=int, default=1024, help="Target size for short edge of the image.")
-    p.add_argument("--prep-pad-square", action="store_true", help="Pad preprocessed image to square with neutral gray.")
-    p.add_argument("--prep-contrast-method", choices=["none", "clahe", "autocontrast"], default="none", help="Contrast enhancement method.")
-    p.add_argument("--prep-gamma", type=float, default=1.0, help="Gamma correction factor.")
-    p.add_argument("--prep-denoise-method", choices=["none", "bilateral", "nlm"], default="none", help="Denoising method.")
-    p.add_argument("--prep-sharpen", action="store_true", help="Apply unsharp mask sharpening.")
-    p.add_argument("--prep-white-balance", action="store_true", help="Apply white balance correction.")
-    p.add_argument("--prep-grid-style", choices=["standard", "transparent", "fine", "none"], default="standard", help="Visual grid overlay style.")
-    p.add_argument("--prep-som-enabled", action="store_true", help="Enable Set-of-Mark visual prompting overlay.")
-    p.add_argument("--prep-tiling-enabled", action="store_true", help="Enable image tiling for small object detection.")
-    p.add_argument("--prep-tile-size", type=int, default=512, help="Tile size in pixels.")
-    p.add_argument("--prep-tile-overlap", type=float, default=0.2, help="Overlap ratio between tiles (0.0 to 0.5).")
-    p.add_argument("--prep-crop-verify-enabled", action="store_true", help="Enable multi-pass Crop & Verify validation pipeline.")
-    p.add_argument("--prep-crop-padding", type=float, default=0.15, help="Context padding ratio for cropped patches.")
-    
+    p.add_argument(
+        "--prep-enabled", action="store_true", help="Enable image preprocessing."
+    )
+    p.add_argument(
+        "--prep-short-edge",
+        type=int,
+        default=1024,
+        help="Target size for short edge of the image.",
+    )
+    p.add_argument(
+        "--prep-pad-square",
+        action="store_true",
+        help="Pad preprocessed image to square with neutral gray.",
+    )
+    p.add_argument(
+        "--prep-contrast-method",
+        choices=["none", "clahe", "autocontrast"],
+        default="none",
+        help="Contrast enhancement method.",
+    )
+    p.add_argument(
+        "--prep-gamma", type=float, default=1.0, help="Gamma correction factor."
+    )
+    p.add_argument(
+        "--prep-denoise-method",
+        choices=["none", "bilateral", "nlm"],
+        default="none",
+        help="Denoising method.",
+    )
+    p.add_argument(
+        "--prep-sharpen", action="store_true", help="Apply unsharp mask sharpening."
+    )
+    p.add_argument(
+        "--prep-white-balance",
+        action="store_true",
+        help="Apply white balance correction.",
+    )
+    p.add_argument(
+        "--prep-grid-style",
+        choices=["standard", "transparent", "fine", "none"],
+        default="standard",
+        help="Visual grid overlay style.",
+    )
+    p.add_argument(
+        "--prep-som-enabled",
+        action="store_true",
+        help="Enable Set-of-Mark visual prompting overlay.",
+    )
+    p.add_argument(
+        "--prep-tiling-enabled",
+        action="store_true",
+        help="Enable image tiling for small object detection.",
+    )
+    p.add_argument(
+        "--prep-tile-size", type=int, default=512, help="Tile size in pixels."
+    )
+    p.add_argument(
+        "--prep-tile-overlap",
+        type=float,
+        default=0.2,
+        help="Overlap ratio between tiles (0.0 to 0.5).",
+    )
+    p.add_argument(
+        "--prep-crop-verify-enabled",
+        action="store_true",
+        help="Enable multi-pass Crop & Verify validation pipeline.",
+    )
+    p.add_argument(
+        "--prep-crop-padding",
+        type=float,
+        default=0.15,
+        help="Context padding ratio for cropped patches.",
+    )
+
     # Custom Grid overlays and VLM processor parameters
-    p.add_argument("--prep-grid-step", type=int, default=100, help="Grid line separation (0-1000 scale).")
-    p.add_argument("--prep-grid-line-width", type=int, default=1, help="Grid line thickness in pixels.")
-    p.add_argument("--prep-grid-font-size", type=int, default=0, help="Grid text label font size (0 for auto).")
-    p.add_argument("--prep-grid-line-color", type=str, default="red", help="Grid line color (Hex or CSS name).")
-    p.add_argument("--prep-grid-text-color", type=str, default="white", help="Grid text label color (Hex or CSS name).")
-    p.add_argument("--prep-grid-backing-color", type=str, default="black", help="Grid text label backing color (Hex or CSS name or 'none').")
-    
-    p.add_argument("--prep-send-pixel-bounds", action="store_true", help="Send min_pixels and max_pixels in API request.")
-    p.add_argument("--prep-min-pixels", type=int, default=200704, help="VLM min_pixels parameter.")
-    p.add_argument("--prep-max-pixels", type=int, default=4194304, help="VLM max_pixels parameter.")
+    p.add_argument(
+        "--prep-grid-step",
+        type=int,
+        default=100,
+        help="Grid line separation (0-1000 scale).",
+    )
+    p.add_argument(
+        "--prep-grid-line-width",
+        type=int,
+        default=1,
+        help="Grid line thickness in pixels.",
+    )
+    p.add_argument(
+        "--prep-grid-font-size",
+        type=int,
+        default=0,
+        help="Grid text label font size (0 for auto).",
+    )
+    p.add_argument(
+        "--prep-grid-line-color",
+        type=str,
+        default="red",
+        help="Grid line color (Hex or CSS name).",
+    )
+    p.add_argument(
+        "--prep-grid-text-color",
+        type=str,
+        default="white",
+        help="Grid text label color (Hex or CSS name).",
+    )
+    p.add_argument(
+        "--prep-grid-backing-color",
+        type=str,
+        default="black",
+        help="Grid text label backing color (Hex or CSS name or 'none').",
+    )
+
+    p.add_argument(
+        "--prep-send-pixel-bounds",
+        action="store_true",
+        help="Send min_pixels and max_pixels in API request.",
+    )
+    p.add_argument(
+        "--prep-min-pixels", type=int, default=200704, help="VLM min_pixels parameter."
+    )
+    p.add_argument(
+        "--prep-max-pixels", type=int, default=4194304, help="VLM max_pixels parameter."
+    )
 
     # --- Output ---
     p.add_argument(
-        "--output-dir", "-o",
+        "--output-dir",
+        "-o",
         metavar="DIR",
         default="./detection_results",
         help="Base output directory. Each image gets its own sub-folder.",
@@ -181,9 +282,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main():
+def main(args: Args = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    if args is None:
+        args = parser.parse_args()
+    else:
+        args = args.to_dict()
 
     # Build clients
     detector_client = OpenAI(api_key=args.api_key, base_url=args.base_url)
@@ -238,7 +342,6 @@ def main():
             "tile_overlap": args.prep_tile_overlap,
             "crop_verify_enabled": args.prep_crop_verify_enabled,
             "crop_padding": args.prep_crop_padding,
-            
             # Custom grid layout parameters
             "grid_step": args.prep_grid_step,
             "grid_line_width": args.prep_grid_line_width,
@@ -246,7 +349,6 @@ def main():
             "grid_line_color": args.prep_grid_line_color,
             "grid_text_color": args.prep_grid_text_color,
             "grid_backing_color": args.prep_grid_backing_color,
-            
             # VLM Processor bounds parameters
             "send_pixel_bounds": args.prep_send_pixel_bounds,
             "min_pixels": args.prep_min_pixels,
@@ -302,16 +404,20 @@ def main():
                 output_dir=str(image_out_dir),
                 progress_callback=on_round,
             )
-            print(f"  ✅ Best: round {best['round']}, score {best['score']}/10, "
-                  f"{len(best['detections'] or [])} detection(s)")
-            all_results.append({
-                "image": str(p),
-                "status": "ok",
-                "best_round": best["round"],
-                "best_score": best["score"],
-                "n_detections": len(best["detections"] or []),
-                "output_dir": str(image_out_dir),
-            })
+            print(
+                f"  ✅ Best: round {best['round']}, score {best['score']}/10, "
+                f"{len(best['detections'] or [])} detection(s)"
+            )
+            all_results.append(
+                {
+                    "image": str(p),
+                    "status": "ok",
+                    "best_round": best["round"],
+                    "best_score": best["score"],
+                    "n_detections": len(best["detections"] or []),
+                    "output_dir": str(image_out_dir),
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"  ❌ ERROR: {exc}", file=sys.stderr)
             all_results.append({"image": str(p), "status": f"error: {exc}"})
