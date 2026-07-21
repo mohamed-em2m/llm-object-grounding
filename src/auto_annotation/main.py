@@ -1,5 +1,12 @@
 """Entry point: parse args, load the dataset yaml, drive the batch runner,
 persist the updated yaml, and stop the local server cleanly.
+
+This module accepts either:
+  * a validated :class:`schemes.PipelineConfig` (the recommended path going
+    forward -- passed in by :mod:`main` after a single shared parse), or
+  * ``None`` -- in which case :func:`auto_annotation.cli.parse_args` is run
+    to read sys.argv directly, for the standalone ``auto-annotation`` entry
+    point or anyone running ``python -m auto_annotation``.
 """
 
 import os
@@ -13,24 +20,37 @@ from auto_annotation.image_io import load_or_init_class_map
 from auto_annotation.server_init import build_client
 from auto_annotation.batch_runner import read_images_with_labels
 from auto_annotation.yaml_utils import save_updated_yaml
-from auto_annotation.cli import parse_args
-from models import Args
+from auto_annotation.cli import parse_args as aa_parse_args
 
 
-def main(args: Args = None):
+def main(args=None):
+    """Run the auto-annotation pipeline.
 
+    Args must be a :class:`PipelineConfig` (preferred) OR an argparse.Namespace
+    with the legacy auto_annotation fields. Passing ``None`` triggers a fresh
+    ``parse_args()`` on ``sys.argv`` for the standalone entry-point case.
+    """
     if args is None:
-        args = parse_args()
-    else:
-        args = args.to_dict()
+        # Standalone invocation (e.g. ``python -m auto_annotation ...`` or
+        # the ``auto-annotation`` console script). Parse from sys.argv.
+        args = aa_parse_args()
 
+    # PipelineConfig is a pydantic BaseModel: pydantic v2 prints a friendly
+    # repr, so callers can pass either flavor transparently. We normalize to
+    # attribute access in either case -- both pydantic BaseModel and argparse
+    # Namespace expose the same dotted API.
     setup_logging(log_level=args.log_level, log_file=args.log_file)
 
+    yaml_path = args.yaml_path
+    if not yaml_path:
+        logger.error("task='auto_label' requires --yaml_path.")
+        exit(1)
+
     try:
-        with open(args.yaml_path, "r") as f:
+        with open(yaml_path, "r") as f:
             data = yaml.safe_load(f)
     except Exception as e:
-        logger.error(f"Failed to read dataset yaml file at {args.yaml_path}: {e}")
+        logger.error(f"Failed to read dataset yaml file at {yaml_path}: {e}")
         exit(1)
 
     class_map = (
@@ -38,7 +58,7 @@ def main(args: Args = None):
     )
 
     # ---- Auto-resume: pick the checkpoint back up if one exists ----
-    os.makedirs(getattr(args, "output_folder"), exist_ok=True)
+    os.makedirs(args.output_folder, exist_ok=True)
     checkpoint = CheckpointManager(args.output_folder)
     completed_images = set()
     batches_done = set()
@@ -93,7 +113,7 @@ def main(args: Args = None):
     stats = RunStats()
 
     def auto_save():
-        save_updated_yaml(args.yaml_path, args.output_folder, data, class_map)
+        save_updated_yaml(yaml_path, args.output_folder, data, class_map)
 
     try:
         read_images_with_labels(
@@ -143,7 +163,7 @@ def main(args: Args = None):
         )
     else:
         try:
-            save_updated_yaml(args.yaml_path, args.output_folder, data, class_map)
+            save_updated_yaml(yaml_path, args.output_folder, data, class_map)
 
             logger.info(f"Done. Final classes: {class_map}")
         except Exception as e:

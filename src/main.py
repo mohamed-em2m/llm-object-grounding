@@ -1,40 +1,65 @@
-from .auto_annotation import main as aa_main
-from .free_detection import main as free_detection
-import argparse
+"""Unified CLI for the LLM object-detection / auto-annotation framework.
 
-from .schemes import PipelineConfig
+This module is the single public entry point for running the project from the
+command line. It exposes:
 
+  * :class:`PipelineConfig`   -- a pydantic model that validates every CLI option
+    (re-exported from :mod:`schemes.argument`).
+  * :func:`build_parser`      -- an :class:`argparse.ArgumentParser` mirror of
+    every field on :class:`PipelineConfig`.
+  * :func:`parse_args`        -- parses ``sys.argv`` (or an explicit argv list),
+    overlays an optional YAML config file, and returns a validated
+    :class:`PipelineConfig` instance.
+  * :func:`main`              -- dispatches to either :func:`free_detection.main`
+    or :func:`auto_annotation.main` based on ``config.task``.
+
+Usage::
+
+    python -m main --task free_detection -i img.jpg -c "person, car"
+    python -m main --task auto_label    --train_image imgs/ --train_label lbls/ \\
+        --yaml_path data.yaml -o ./out --model local-model
 """
-Unified configuration for the VLM defect-relabeling + LLM object-detection pipeline.
 
-Exposes:
-  * PipelineConfig   – a pydantic model that validates every CLI option.
-  * build_parser()   – merged argparse parser mirroring PipelineConfig.
-  * parse_args()     – convenience helper that returns a PipelineConfig instance.
-"""
-
-from typing import List, Optional, Literal
+from __future__ import annotations
 
 import argparse
+import logging
+import sys
 import yaml
+from typing import Any, List, Optional
 
-# ---------------------------------------------------------------------------
-# Pydantic model
-# ---------------------------------------------------------------------------
+from schemes import PipelineConfig
+
+logger = logging.getLogger("llmog.main")
 
 
 # ---------------------------------------------------------------------------
 # Argparse parser (mirrors PipelineConfig exactly)
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
+    """Return an :class:`argparse.ArgumentParser` whose dest names exactly match
+    :class:`PipelineConfig` field names, so a plain ``vars(namespace)`` can be
+    fed straight into the pydantic model."""
+
     p = argparse.ArgumentParser(
-        prog="vlm-pipeline",
+        prog="llmog",
         description=(
-            "Unified CLI for (a) relabeling binary defect/no-defect YOLO annotations "
-            "into multi-class defect labels with a VLM, and (b) running the LLM "
-            "object-detection pipeline on individual images."
+            "Unified CLI for the LLM object-detection framework. Two tasks are "
+            "supported via --task: 'free_detection' runs the detector/judge "
+            "pipeline on explicit images; 'auto_label' relabels binary "
+            "defect/no-defect YOLO annotations into multi-class labels."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # --- Task selection -----------------------------------------------------
+    p.add_argument(
+        "--task",
+        choices=["free_detection", "auto_label"],
+        default="free_detection",
+        help="Which pipeline to run. 'free_detection' -> detector/judge loop on "
+        "explicit --image paths. 'auto_label' -> batch YOLO relabeling from a "
+        "--train_image folder + --yaml_path.",
     )
 
     # --- Logging -----------------------------------------------------------
@@ -53,15 +78,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         action="append",
         dest="images",
-        help="Path to an input image (detection mode). Repeatable.",
+        help="Path to an input image (free_detection task). Repeatable.",
     )
     p.add_argument(
-        "--train_image", default=None, help="Folder of training images (relabel mode)."
+        "--train_image",
+        default=None,
+        help="Folder of training images (auto_label task).",
     )
     p.add_argument(
         "--train_label",
         default=None,
-        help="Folder of YOLO training labels (relabel mode).",
+        help="Folder of YOLO training labels (auto_label task).",
     )
     p.add_argument(
         "--yaml_path", default=None, help="Path to dataset YAML (data.yaml)."
@@ -77,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--categories",
         "-c",
         default="person, car, bicycle, dog, cat",
-        help="Comma-separated object categories to detect.",
+        help="Comma-separated object categories to detect (free_detection).",
     )
     p.add_argument(
         "--definitions",
@@ -88,14 +115,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--init_class_map",
         action="store_true",
-        help="Initialize class map from the YAML file.",
+        help="Initialize class map from the YAML file (auto_label).",
     )
     p.add_argument(
         "--conf_threshold",
         type=int,
         default=2,
         choices=[1, 2, 3, 4, 5],
-        help="Confidence threshold (1–5) for low-confidence review log.",
+        help="Confidence threshold (1-5) for low-confidence review log (auto_label).",
     )
 
     # --- Output ------------------------------------------------------------
@@ -106,9 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory (results or relabeled annotations).",
     )
     p.add_argument(
+        "--output_dir",
+        default=None,
+        help="Alias for --output_folder (free_detection). Hidden to keep the "
+        "schema clean; if both are passed, --output_folder wins.",
+    )
+    p.add_argument(
         "--inplace_saving",
         action="store_true",
-        help="Save relabeled annotations in the original label folder.",
+        help="Save relabeled annotations in the original label folder (auto_label).",
     )
     p.add_argument(
         "--no_plot", action="store_true", help="Skip the matplotlib preview window."
@@ -216,13 +249,6 @@ def build_parser() -> argparse.ArgumentParser:
         dest="use_mtp",
         help="Disable draft-MTP speculative decoding.",
     )
-
-    p.add_argument(
-        "--serving_extra",
-        type=dict,
-        default={},
-        help="this argument will used in running and launagch server",
-    )
     p.add_argument(
         "--ctx_size", type=int, default=20000, help="Context size for llama.cpp."
     )
@@ -242,7 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--score_threshold",
         type=int,
         default=8,
-        help="Stop early when judge score reaches this value (0–10).",
+        help="Stop early when judge score reaches this value (0-10).",
     )
     p.add_argument("--detector_temperature", type=float, default=0.9)
     p.add_argument("--detector_top_p", type=float, default=0.95)
@@ -282,7 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--extra_args",
         action="append",
         default=None,
-        help="Extra args forwarded to vLLM server.",
+        help="Extra raw tokens forwarded to vLLM server (repeatable).",
     )
 
     # --- VLM image encoding -----------------------------------------------
@@ -337,51 +363,169 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prep_min_pixels", type=int, default=200_704)
     p.add_argument("--prep_max_pixels", type=int, default=4_194_304)
 
+    # --- Serving extras ---------------------------------------------------
+    p.add_argument(
+        "--serving_extra",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Extra override tokens for the underlying server-manager kwargs, "
+        "in 'key=value' form (repeatable). Parsed into a dict on the config.",
+    )
+
+    # --- Config file ------------------------------------------------------
     p.add_argument(
         "--config",
         type=str,
         default=None,
-        help="Path to PipelineConfig yaml file.",
+        help="Path to a PipelineConfig YAML file. Values are loaded first and "
+        "overridden by explicit CLI flags.",
     )
+
     return p
+
+
+# ---------------------------------------------------------------------------
+# YAML loader
+# ---------------------------------------------------------------------------
+def _load_yaml_config(path: str) -> dict:
+    """Read a YAML config file into a flat dict of field-name -> value."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"--config file '{path}' must contain a YAML mapping.")
+    return data
+
+
+def _coerce_serving_extra(raw: Optional[List[str]]) -> dict:
+    """Convert repeated ``key=value`` CLI tokens into a dict."""
+    if raw is None:
+        return {}
+    out: dict = {}
+    for token in raw:
+        if "=" not in token:
+            raise ValueError(
+                f"--serving_extra must be 'key=value', got: {token!r}"
+            )
+        key, _, value = token.partition("=")
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--serving_extra has empty key in {token!r}")
+        # Try to coerce numeric / bool literals so pydantic stays happy.
+        v: Any = value.strip()
+        if v.lower() in {"true", "false"}:
+            v = v.lower() == "true"
+        else:
+            try:
+                v = int(v)
+            except ValueError:
+                try:
+                    v = float(v)
+                except ValueError:
+                    pass
+        out[key] = v
+    return out
 
 
 # ---------------------------------------------------------------------------
 # parse_args helper
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None) -> PipelineConfig:
-    """Parse CLI args and return a validated :class:`PipelineConfig`."""
+    """Parse CLI args (and optional ``--config`` YAML) -> validated
+    :class:`PipelineConfig`.
 
+    Precedence (lowest to highest):
+      1. PipelineConfig field defaults
+      2. YAML key/values from ``--config``
+      3. Explicit CLI flags
+    """
     parser = build_parser()
 
-    # Load config from YAML if provided
-    if args.config:
-        with open(args.config, "r") as f:
-            cfg_yaml = yaml.safe_load(f)
-            # Update ns with YAML values (they will be overwritten by explicit CLI args)
-            ns = vars(ns)
-            for k, v in cfg_yaml.items():
-                if k in ns:
-                    ns[k] = v
-            ns = argparse.Namespace(**ns)
+    # Use argparse.SUPPRESS for every optional arg's default so that unset
+    # flags don't appear in the parsed namespace at all. This makes it
+    # possible to layer YAML (base) < CLI (explicit) < pydantic defaults
+    # (anything still missing) -- which is exactly the precedence users
+    # expect from a config-file system: explicit CLI flags always win over
+    # YAML, and YAML always wins over framework defaults.
+    for action in parser._actions:
+        if action.dest in (argparse.SUPPRESS, "help"):
+            continue
+        # store_true / store_false flags keep their False/True literal default
+        # (pydantic still wants a real bool rather than SUPPRESS), but explicit
+        # CLI passing sets them to the opposite so the precedence still works
+        # because the YAML layer only fills values that are missing entirely.
+        action.default = argparse.SUPPRESS
 
+    # First-pass: parse only enough to discover --config.
+    ns_peek, _ = parser.parse_known_args(argv)
+    overrides: dict = {}
+    if getattr(ns_peek, "config", None):
+        overrides = _load_yaml_config(ns_peek.config)
+
+    # With all defaults SUPPRESSED, parse_args only puts explicitly-passed
+    # flags into the namespace -- exactly what we want for the precedence:
+    #   pydantic defaults  <  YAML  <  CLI
     ns = parser.parse_args(argv)
-    # Drop any None-valued extras so pydantic defaults apply cleanly.
-    raw = {k: v for k, v in vars(ns).items() if v is not None}
+    raw = vars(ns)
+
+    # base layer: YAML overrides pydantic defaults
+    # CLI explicit flags override YAML
+    merged: dict = {**overrides, **raw}
+
+    # --- output_dir alias --------------------------------------------------
+    yaml_outdir = overrides.get("output_dir") or overrides.get("output_folder")
+    cli_outdir = raw.get("output_dir")
+    if cli_outdir is not None:
+        merged["output_folder"] = cli_outdir
+    elif yaml_outdir is not None and "output_folder" not in raw:
+        merged["output_folder"] = yaml_outdir
+    merged.pop("output_dir", None)
+
+    # --- serving_extra -----------------------------------------------------
+    cli_extra = _coerce_serving_extra(raw.get("serving_extra"))
+    yaml_extra = overrides.get("serving_extra", {}) or {}
+    # CLI wins; YAML fills the gaps.
+    merged["serving_extra"] = {**yaml_extra, **cli_extra}
+
+    # config is consumed, not a PipelineConfig field
+    merged.pop("config", None)
+
+    # Drop any None values so pydantic defaults apply where neither CLI nor
+    # YAML supplied a value. (PipelineConfig forbids extras, so we must not
+    # leave stray Nones for fields the model has no default-on-None policy
+    # for -- in practice every field has a real default, so this is a no-op
+    # belt-and-braces guard.)
+    merged = {k: v for k, v in merged.items() if v is not None}
+
     try:
-        return PipelineConfig(**raw)
+        return PipelineConfig(**merged)
     except Exception as exc:  # surface validation errors nicely
         parser.error(str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+def main(argv: Optional[List[str]] = None) -> None:
+    """Dispatch to the selected task's entry point based on ``config.task``."""
+    config = parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, config.log_level, logging.INFO),
+        format="[%(levelname)s] %(message)s",
+    )
+
+    if config.task == "free_detection":
+        from free_detection import main as free_detection_main
+
+        free_detection_main(config)
+    elif config.task == "auto_label":
+        from auto_annotation import main as auto_annotation_main
+
+        auto_annotation_main(config)
+    else:  # pragma: no cover -- guarded by Literal + argparse choices
+        raise ValueError(f"Invalid task: {config.task!r}")
+
+
 if __name__ == "__main__":
-    # parse args
-    args = parse_args()
-
-    if args.task == "auto_label":
-        aa_main(args)
-    elif args.task == "free_detection":
-        free_detection(args)
-
-    else:
-        raise ValueError("Invalid run type")
+    main(sys.argv[1:])

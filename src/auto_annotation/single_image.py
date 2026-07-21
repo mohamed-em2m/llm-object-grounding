@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from image_preprocessing import preprocess_custom_resize
+from free_detection.image_preprocessing import preprocess_custom_resize
 from auto_annotation.logging_utils import logger
 from auto_annotation.image_io import detect_defect
 

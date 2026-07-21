@@ -1,17 +1,22 @@
-"""CLI argument parsing for the auto-annotation pipeline."""
+"""CLI argument parsing for the auto-annotation pipeline.
+
+This parser is intentionally a thin standalone layer kept for the
+``auto-annotation`` console script and ``python -m auto_annotation``.
+
+When invoked through the unified entry point in :mod:`main` (with
+``--task auto_label``), :class:`PipelineConfig` is already validated and
+:this parser is bypassed entirely. Both flavours accept the exact same flags
+:though, so behaviour is identical.
+"""
 
 import argparse
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Relabel binary defect/no-defect YOLO annotations into multi-class defect labels using a VLM."
-    )
-    # Logging Configuration
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--log_level",
         type=str,
-        default="DEBUG",
+        default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Set the logging level (default: INFO).",
     )
@@ -22,7 +27,9 @@ def parse_args():
         help="Optional path to a file where logs should also be written.",
     )
     parser.add_argument(
+        "--output_folder",
         "--output-folder",
+        dest="output_folder",
         type=str,
         required=True,
         help="Where to save the relabeled output.",
@@ -327,6 +334,14 @@ def parse_args():
         help="Extra arguments to pass to vLLM server.",
     )
     parser.add_argument(
+        "--serving_extra",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Extra override tokens for the underlying server-manager kwargs, "
+        "in 'key=value' form (repeatable).",
+    )
+    parser.add_argument(
         "--image_min_tokens",
         type=int,
         default=1024,
@@ -360,7 +375,20 @@ def parse_args():
         action="store_true",
         help="save inplace the relabeled annotations in the original label folder instead of a separate output folder.",
     )
-    args = parser.parse_args()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the standalone argparse parser for the auto-annotation pipeline."""
+    parser = argparse.ArgumentParser(
+        description="Relabel binary defect/no-defect YOLO annotations into multi-class defect labels using a VLM."
+    )
+    _add_arguments(parser)
+    return parser
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     if args.start_index is not None and args.start_index < 0:
         parser.error("--start_index must be >= 0")
@@ -370,5 +398,29 @@ def parse_args():
         and args.end_index <= args.start_index
     ):
         parser.error("--end_index must be greater than --start_index")
+
+    # Normalize serving_extra from list[str] -> dict for downstream consumers.
+    if getattr(args, "serving_extra", None):
+        coerced = {}
+        for token in args.serving_extra:
+            if "=" not in token:
+                parser.error(f"--serving_extra must be 'key=value', got: {token!r}")
+            k, _, v = token.partition("=")
+            k = k.strip()
+            v = v.strip()
+            if v.lower() in {"true", "false"}:
+                v = v.lower() == "true"
+            else:
+                try:
+                    v = int(v)
+                except ValueError:
+                    try:
+                        v = float(v)
+                    except ValueError:
+                        pass
+            coerced[k] = v
+        args.serving_extra = coerced
+    else:
+        args.serving_extra = {}
 
     return args

@@ -40,7 +40,7 @@ src_dir = Path(__file__).parent
 if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
 
-from detection_pipeline import (
+from free_detection.detection_pipeline import (
     ObjectDetectionPipeline,
     RoundResult,
     draw_grid,

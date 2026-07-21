@@ -1,7 +1,7 @@
 [project]
-name = "llm-object-grounding"
+name = "llmog"
 version = "0.1.0"
-description = "Interactive test console for assessing Vision-Language Models (VLMs) on general Object Detection tasks"
+description = "A pipeline for object detection using LLMs."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
     "numpy>=1.24.0",
     "streamlit>=1.58.0",
     "opencv-python>=4.9.0.80",
+    "rich>=15.0.0",
 ]
 
 [project.optional-dependencies]
@@ -23,13 +24,13 @@ vllm = ["vllm>=0.6.0"]
 
 
 [project.scripts]
-# Launch the Gradio web interface
-detection-gui = "gui:main"
-# Run the pipeline from the terminal (no GUI required)
-detection-cli = "cli:main"
-
-# Launch the auto annotation server with vllm
+# Unified entry point: dispatch to free_detection or auto_annotation via --task
+llmog = "main:main"
+# Convenience aliases that pass the right --task for you
+detection-cli = "free_detection:main"
 auto-annotation = "auto_annotation:main"
+# Launch the Gradio web interface
+detection-gui = "free_detection.gui:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

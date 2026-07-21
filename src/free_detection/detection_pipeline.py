@@ -43,7 +43,7 @@ import matplotlib.pyplot as plt
 from openai import OpenAI
 from json_repair import repair_json
 
-from image_preprocessing import (
+from free_detection.image_preprocessing import (
     preprocess_resolution,
     preprocess_custom_resize,
     preprocess_contrast,

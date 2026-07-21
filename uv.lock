@@ -2293,7 +2293,7 @@ wheels = [
 ]
 
 [[package]]
-name = "llm-object-grounding"
+name = "llmog"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -2307,6 +2307,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pillow" },
     { name = "requests" },
+    { name = "rich" },
     { name = "streamlit" },
     { name = "wrapt" },
 ]
@@ -2328,6 +2329,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.9.0.80" },
     { name = "pillow", specifier = "==12.2.0" },
     { name = "requests", specifier = ">=2.34.2" },
+    { name = "rich", specifier = ">=15.0.0" },
     { name = "streamlit", specifier = ">=1.58.0" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = ">=0.6.0" },
     { name = "wrapt", specifier = ">=2.2.2" },

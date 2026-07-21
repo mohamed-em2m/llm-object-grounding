@@ -34,7 +34,7 @@ src_dir = Path(__file__).parent
 if str(src_dir) not in sys.path:
     sys.path.append(str(src_dir))
 
-from detection_pipeline import (
+from free_detection.detection_pipeline import (
     ObjectDetectionPipeline,
     RoundResult,
     draw_grid,
@@ -43,7 +43,9 @@ from detection_pipeline import (
 )
 from servers import LlamaServerManager
 
-_iface_dir = os.path.join(os.path.dirname(__file__), "interface")
+# Interface assets (console.css / console.js) live at src/interface/, the
+# package root's sibling, NOT inside the free_detection package itself.
+_iface_dir = os.path.join(os.path.dirname(__file__), os.pardir, "interface")
 
 with open(os.path.join(_iface_dir, "console.css"), encoding="utf-8") as f:
     custom_css = f.read()

@@ -1,48 +1,78 @@
+# 🔍 llmog (LLM Object Detection) 
+
+**An Library for object detection tasks using LLMs.**
+
 ![Preview](assets/image.png)
-# 🔍 LLM Object Detection Testing Console
 
-An interactive test console and command-line tool for assessing and refining Vision-Language Models (VLMs) on general Object Detection tasks. 
+This project implements an iterative **Detector-Judge pipeline**: a VLM "detector" agent proposes bounding boxes, a VLM "judge" agent critiques them against the original image, and the loop repeats with structured feedback until the annotations meet a quality threshold or the round limit is reached.
 
-This project implements an iterative **Detector-Judge pipeline** that prompts a VLM "detector" agent to locate objects, lets a VLM "judge" agent critique the proposed boxes against the original image, and repeats the loop with structured feedback until the annotations meet a quality threshold or the round limit is reached.
+It ships **two complementary workflows** behind a single unified CLI:
+
+| `--task` | What it does | Typical input |
+|----------|---------------|----------------|
+| `free_detection` | Runs the detector→judge loop on explicitly supplied `--image` paths and dumps per-image annotations + history. | One or more `--image` paths + `--categories` |
+| `auto_label` | Walks a YOLO-format dataset folder (`--train_image`/`--train_label` + `data.yaml`), relabels each binary defect/no-defect box into a multi-class label using a VLM classify-this-crop call, and persists an updated `data.yaml`. | `--train_image`, `--train_label`, `--yaml_path`, `--model` |
+
+---
+
+## Table of Contents
+
+- [Key Features](#-key-features)
+- [Setup & Installation](#-setup--installation)
+- [Usage](#️-usage)
+  - [1. Launching the Web GUI](#1-launching-the-web-gui)
+  - [2. Free-Detection CLI](#2-free-detection-cli---task-free_detection)
+  - [3. Auto-Labeling CLI](#3-auto-labeling-cli---task-auto_label)
+  - [4. YAML Config + CLI Overrides](#4-yaml-config--cli-overrides)
+- [Output Structure](#-output-structure)
+- [Technology Stack](#️-technology-stack)
 
 ---
 
 ## 🌟 Key Features
 
-* **Iterative Refinement Loop**: Enhances detection accuracy by feeding visual and text-based critiques back to the detector across multiple rounds.
-* **Advanced Image Preprocessing & Augmentation Pipeline**:
-  * **Dynamic Resolution Tuning**: Custom upscaling target for short edge and optional letterbox padding to maintain aspect ratio on square inputs.
-  * **Contrast & Color Enhancements**: LAB color-space CLAHE, global autocontrast, gamma correction (0.5–2.0), and Gray World white balance correction.
-  * **Noise Filtering & Sharpening**: Bilateral or Non-Local Means (NLM) denoising with edge preservation, and unsharp mask sharpening.
-  * **Tiling Engine for Small Objects**: Slices high-resolution inputs into overlapping sub-patches, runs sequential detection on each tile, and merges overlapping detections using Non-Maximum Suppression (NMS).
-  * **Crop & Verify Validation**: Runs a second-pass confirmation on cropped candidate coordinates with context padding to reduce hallucinated detections.
-  * **Set-of-Mark (SoM) Prompting**: Classic CV contour detection overlays numbered candidate regions onto the image to convert the spatial regression task into a simpler classification/selection task.
-  * **Fully Customizable Grid Overlays**: Adjustable style (standard, transparent, fine, none), step size (divisions), line thickness, font size, and custom grid color palettes (line, text, and text-backing box colors with CSS name or hex inputs).
-  * **VLM Processor Pixel Bounds**: Manually configure `min_pixels` and `max_pixels` request parameters (passed in the API request's `extra_body` payload) to tune vision encoder resolution and prevent OOMs on backends like vLLM / Qwen-VL.
-* **Gradio Web Interface**:
-  * **🦙 Llama Server**: Start, stop, and configure multiple local `llama-server` instances on different ports, track logs, and select the active server.
-  * **⚙️ Detection Settings**: Customize target categories, category definitions, prompt templates, per-role model/server routing, and sampling parameters.
-  * **🧪 Batch Test**: Upload multiple images, run them sequentially, view live per-round annotated results, and download all outputs as a `.zip` archive.
-  * **🖼️ Interactive Preprocessing & Custom Grids**: Tweak all resolution scaling, filters, tiling options, custom grid colors, text sizes, and pixel bounds directly through visual control elements.
-* **Command-Line Interface (CLI)**: Run the object detection pipeline on single or multiple images directly from your terminal.
-* **Visual Annotations & Grids**: Automatically overlays a customizable 0-1000 coordinate grid on images to aid the VLM's spatial reasoning, and draws lime-green bounding boxes with legible text labels for final detections.
-* **Robust File Persistence**: Saves the best annotated image, raw JSON detections, and complete round-by-round history for every processed image.
+**Core pipeline**
+- **Iterative Refinement Loop** — enhances detection accuracy by feeding visual and text-based critiques back to the detector across multiple rounds.
+- **Unified CLI** — a single entry point (`uv run llmog --task ...`) routes to either workflow; the legacy `detection-cli` and `auto-annotation` aliases are kept as shortcuts.
+- **YAML Config + CLI Precedence** — every flag can live in a YAML file loaded via `--config`. Explicit CLI flags always win over YAML, which wins over framework defaults.
+- **Batch YOLO Auto-Labeling** — `auto_label` mode walks an existing defect/no-defect dataset, asks the VLM to classify each cropped box, accumulates a `class_map`, and updates `data.yaml` in place — with resumable checkpoints and batched I/O.
+- **Visual Annotations & Grids** — automatically overlays a customizable 0–1000 coordinate grid on images to aid the VLM's spatial reasoning, and draws lime-green bounding boxes with legible text labels for final detections.
+- **Robust File Persistence** — saves the best annotated image, raw JSON detections, and complete round-by-round history for every processed image.
+
+**Advanced image preprocessing & augmentation**
+- **Dynamic Resolution Tuning** — custom upscaling target for the short edge, with optional letterbox padding to preserve aspect ratio on square inputs.
+- **Contrast & Color Enhancements** — LAB color-space CLAHE, global autocontrast, gamma correction (0.5–2.0), and Gray World white balance correction.
+- **Noise Filtering & Sharpening** — bilateral or Non-Local Means (NLM) denoising with edge preservation, plus unsharp mask sharpening.
+- **Tiling Engine for Small Objects** — slices high-resolution inputs into overlapping sub-patches, runs sequential detection on each tile, and merges overlapping detections with Non-Maximum Suppression (NMS).
+- **Crop & Verify Validation** — runs a second-pass confirmation on cropped candidate coordinates with context padding to reduce hallucinated detections.
+- **Set-of-Mark (SoM) Prompting** — classic CV contour detection overlays numbered candidate regions onto the image, turning the spatial regression task into a simpler classification/selection task.
+- **Fully Customizable Grid Overlays** — adjustable style (standard, transparent, fine, none), step size, line thickness, font size, and custom colors (line, text, and text-backing box — CSS name or hex).
+- **VLM Processor Pixel Bounds** — manually configure `min_pixels` and `max_pixels` request parameters (passed via the API request's `extra_body`) to tune vision encoder resolution and prevent OOMs on backends like vLLM / Qwen-VL.
+
+**Server lifecycle managers (`src/servers/`)**
+- 🦙 **`LlamaServerManager`** — manage local `llama-server` background processes, configure ports, context sizes (`--ctx-size`), KV cache quantization (`--cache-type-k`/`--cache-type-v`), parallel request slots, draft models, flash attention, and reasoning toggles.
+- ⚡ **`VllmServerManager`** — launch and control local `vLLM` instances with tensor/pipeline parallelism, custom dtypes, prefix caching, and chunked prefill options.
+
+**Gradio web interface**
+- 🦙 **Server Management** — start, stop, and monitor multiple local `llama-server` / `vLLM` instances directly within the GUI.
+- ⚙️ **Detection Settings** — customize target categories, category definitions, prompt templates, per-role model/server routing, and sampling parameters.
+- 🧪 **Batch Test** — upload multiple images, run them sequentially, view live per-round annotated results, and download all outputs as a `.zip` archive.
+- 🖼️ **Interactive Preprocessing & Custom Grids** — tweak all resolution scaling, filters, tiling options, grid colors, text sizes, and pixel bounds directly through visual controls.
 
 ---
 
 ## 🚀 Setup & Installation
 
-This project is managed with [uv](https://github.com/astral-sh/uv), a fast Python package installer and resolver.
+**Requirements:** Python 3.12+, [uv](https://github.com/astral-sh/uv), and (optionally) a CUDA-capable GPU for local `llama.cpp` inference.
 
 1. **Clone the repository**:
    ```bash
    git clone https://github.com/mohamed-em2m/llm-object-grounding.git
    cd llm-object-grounding
    ```
-
 2. **Install dependencies**:
    ```bash
-   ./scripts/install_llama_cpp.sh
+   ./scripts/install_llama_cpp.sh   # Linux only; builds llama.cpp with CUDA
    uv sync
    ```
 
@@ -50,103 +80,214 @@ This project is managed with [uv](https://github.com/astral-sh/uv), a fast Pytho
 
 ## 🖥️ Usage
 
+There is one unified entry point — `llmog` — that dispatches by `--task`:
+
+```bash
+uv run llmog --task free_detection -i image.jpg -c "person, car, dog"
+uv run llmog --task auto_label     --train_image imgs/ --train_label lbls/ \
+    --yaml_path data.yaml --model local-model -o ./out
+```
+
+Both workflows also have shortcut aliases that pre-set the right `--task` for you:
+
+```bash
+uv run detection-cli -i image.jpg -c "person, car, dog"
+uv run auto-annotation --train_image imgs/ --train_label lbls/ \
+    --yaml_path data.yaml --model local-model -o ./out
+```
+
+> **Single source of truth**: every CLI flag is defined on `src/schemes/argument.py:PipelineConfig` (a pydantic v2 model). `src/main.py:build_parser` mirrors that model onto an `argparse.ArgumentParser`, and `parse_args()` overlays an optional `--config <yaml>` file before constructing the validated `PipelineConfig`. Both dashed (`--prep-tile-size`) and underscored (`--prep_tile_size`) forms are accepted.
+
 ### 1. Launching the Web GUI
+
 To launch the interactive Gradio interface:
+
 ```bash
 uv run detection-gui
 ```
+
 Options:
-* `--host`: Host to bind the Gradio server to (default: `0.0.0.0`).
-* `--port`: Port to run the server on (default: `7860`).
-* `--share`: Create a public Gradio share link.
-* `--no-queue`: Disable Gradio's request queue.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--host` | Host to bind the Gradio server to | `0.0.0.0` |
+| `--port` | Port to run the server on | `7860` |
+| `--share` | Create a public Gradio share link | off |
+| `--no-queue` | Disable Gradio's request queue | off |
 
 Example:
+
 ```bash
 uv run detection-gui --port 7861 --share
 ```
 
-### 2. Running the Command-Line Interface (CLI)
-You can run the detection pipeline directly from the command line:
+### 2. Free-Detection CLI (`--task free_detection`)
+
+Run the detector→judge pipeline on one or more images:
+
 ```bash
-uv run detection-cli --image path/to/image.jpg --categories "person, car, dog"
+uv run llmog --task free_detection --image path/to/image.jpg --categories "person, car, dog"
 ```
 
-#### CLI Options:
-* `-i`, `--image`: Path to the input image (can be specified multiple times for batch processing).
-* `-c`, `--categories`: Comma-separated list of object categories to detect (default: `person, car, bicycle, dog, cat`).
-* `-d`, `--definitions`: Optional category definitions to help the VLM distinguish similar categories.
-* `--base-url`: OpenAI-compatible API base URL (default: `http://localhost:8080/v1`).
-* `--detector-model` / `--judge-model`: Models to use for detection and judging.
-* `--max-rounds`: Max detector-judge iterations per image (default: `2`).
-* `--score-threshold`: Quality score (0-10) to stop the loop early (default: `8`).
-* `--output-dir`: Output directory to save the results (default: `./detection_results`).
-* `--no-plot`: Skip displaying the matplotlib preview window after completion.
+#### Common options
 
-##### Preprocessing Pipeline options:
-* `--prep-enabled`: Enable image preprocessing.
-* `--prep-short-edge`: Target size for short edge of the image (default: `1024`).
-* `--prep-pad-square`: Pad preprocessed image to square with neutral gray.
-* `--prep-contrast-method`: Contrast enhancement method (`none`, `clahe`, `autocontrast`).
-* `--prep-gamma`: Gamma correction factor (default: `1.0`).
-* `--prep-denoise-method`: Denoising method (`none`, `bilateral`, `nlm`).
-* `--prep-sharpen`: Apply unsharp mask sharpening.
-* `--prep-white-balance`: Apply white balance correction.
-* `--prep-som-enabled`: Enable Set-of-Mark visual prompting overlay.
-* `--prep-tiling-enabled`: Enable image tiling for small object detection.
-* `--prep-tile-size`: Tile size in pixels (default: `512`).
-* `--prep-tile-overlap`: Overlap ratio between tiles (default: `0.2`).
-* `--prep-crop-verify-enabled`: Enable multi-pass Crop & Verify validation pipeline.
-* `--prep-crop-padding`: Context padding ratio for cropped patches (default: `0.15`).
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i`, `--image` | Path to an input image (repeatable for batch processing) | — |
+| `-c`, `--categories` | Comma-separated list of object categories to detect | `person, car, bicycle, dog, cat` |
+| `-d`, `--definitions` | Optional category definitions to help the VLM distinguish similar categories | — |
+| `--base_url` | OpenAI-compatible API base URL | `http://localhost:8080/v1` |
+| `--detector_model` / `--judge_model` | Models to use for detection and judging | — |
+| `--judge_url` | Separate base URL for the judge model | same as `--base_url` |
+| `--max_rounds` | Max detector→judge iterations per image | `2` |
+| `--score_threshold` | Quality score (0–10) to stop the loop early | `8` |
+| `-o`, `--output_folder` (also `--output_dir`) | Output directory for results | `./detection_results` |
+| `--no_plot` | Skip displaying the matplotlib preview window after completion | off |
 
-##### Custom Grid & VLM Pixel Bounds options:
-* `--prep-grid-style`: Visual grid overlay style (`standard`, `transparent`, `fine`, `none` - default: `standard`).
-* `--prep-grid-step`: Grid line separation on a 0-1000 scale (default: `100`).
-* `--prep-grid-line-width`: Grid line thickness in pixels (default: `1`).
-* `--prep-grid-font-size`: Grid text label font size (default: `0` / auto).
-* `--prep-grid-line-color`: Grid line color - CSS color name or hex string (default: `red`).
-* `--prep-grid-text-color`: Grid text label color - CSS color name or hex string (default: `white`).
-* `--prep-grid-backing-color`: Grid text label backing box color - CSS color name, hex, or `'none'` (default: `black`).
-* `--prep-send-pixel-bounds`: Send min_pixels and max_pixels in OpenAI-compatible API request payload.
-* `--prep-min-pixels`: VLM min_pixels parameter passed to model processor (default: `200704`).
-* `--prep-max-pixels`: VLM max_pixels parameter passed to model processor (default: `4194304`).
+#### Preprocessing pipeline options
 
-Example running CLAHE, NMS tiling, custom blue coordinates, and custom Qwen-VL model bounds:
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--prep_enabled` | Enable image preprocessing | off |
+| `--prep_short_edge` | Target size for the short edge of the image | `1024` |
+| `--prep_pad_square` | Pad preprocessed image to square with neutral gray | off |
+| `--prep_contrast_method` | Contrast enhancement method (`none`, `clahe`, `autocontrast`) | `none` |
+| `--prep_gamma` | Gamma correction factor | `1.0` |
+| `--prep_denoise_method` | Denoising method (`none`, `bilateral`, `nlm`) | `none` |
+| `--prep_sharpen` | Apply unsharp mask sharpening | off |
+| `--prep_white_balance` | Apply white balance correction | off |
+| `--prep_som_enabled` | Enable Set-of-Mark visual prompting overlay | off |
+| `--prep_tiling_enabled` | Enable image tiling for small object detection | off |
+| `--prep_tile_size` | Tile size in pixels | `512` |
+| `--prep_tile_overlap` | Overlap ratio between tiles | `0.2` |
+| `--prep_crop_verify_enabled` | Enable multi-pass Crop & Verify validation pipeline | off |
+| `--prep_crop_padding` | Context padding ratio for cropped patches | `0.15` |
+
+#### Custom grid & VLM pixel bounds options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--prep_grid_style` | Visual grid overlay style (`standard`, `transparent`, `fine`, `none`) | `standard` |
+| `--prep_grid_step` | Grid line separation on a 0–1000 scale | `100` |
+| `--prep_grid_line_width` | Grid line thickness in pixels | `1` |
+| `--prep_grid_font_size` | Grid text label font size (`0` = auto) | `0` |
+| `--prep_grid_line_color` | Grid line color — CSS name or hex | `red` |
+| `--prep_grid_text_color` | Grid text label color — CSS name or hex | `white` |
+| `--prep_grid_backing_color` | Grid text label backing box color — CSS name, hex, or `'none'` | `black` |
+| `--prep_send_pixel_bounds` | Send `min_pixels`/`max_pixels` in the OpenAI-compatible API request payload | off |
+| `--prep_min_pixels` | VLM `min_pixels` parameter passed to the model processor | `200704` |
+| `--prep_max_pixels` | VLM `max_pixels` parameter passed to the model processor | `4194304` |
+
+Example running CLAHE, NMS tiling, custom blue grid coordinates, and custom Qwen-VL pixel bounds:
+
 ```bash
-uv run detection-cli \
+uv run llmog --task free_detection \
   -i industrial_part.jpg \
   -c "crack, scratch, dent" \
-  --prep-enabled \
-  --prep-contrast-method clahe \
-  --prep-tiling-enabled \
-  --prep-tile-size 512 \
-  --prep-tile-overlap 0.25 \
-  --prep-grid-line-color "blue" \
-  --prep-grid-step 50 \
-  --prep-send-pixel-bounds \
-  --prep-min-pixels 200704 \
-  --prep-max-pixels 2097152 \
-  --output-dir ./inspection_results
+  --prep_enabled \
+  --prep_contrast_method clahe \
+  --prep_tiling_enabled \
+  --prep_tile_size 512 \
+  --prep_tile_overlap 0.25 \
+  --prep_grid_line_color "blue" \
+  --prep_grid_step 50 \
+  --prep_send_pixel_bounds \
+  --prep_min_pixels 200704 \
+  --prep_max_pixels 2097152 \
+  -o ./inspection_results
+```
+
+### 3. Auto-Labeling CLI (`--task auto_label`)
+
+Walk an existing YOLO-format dataset (binary defect/no-defect), re-classify each annotated crop with a VLM, accumulate a class map, and persist the updated `data.yaml`.
+
+```bash
+uv run llmog --task auto_label \
+    --train_image imgs/ --train_label lbls/ \
+    --yaml_path data.yaml \
+    --model local-model \
+    -o ./out
+```
+
+#### Auto-label-specific options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--train_image` | Folder containing the training images (required) | — |
+| `--train_label` | Folder containing the YOLO `.txt` label files (required) | — |
+| `--yaml_path` | Path to the dataset's `data.yaml` (required) | — |
+| `--init_class_map` | Initialize the class map from the YAML's `names` list | off |
+| `--conf_threshold` | Confidence (1–5); boxes at or below this are also logged to a `*_low_confidence.json` for manual review | `2` |
+| `--inplace_saving` | Write relabeled `.txt` files back over the originals | off (writes to `--output_folder`) |
+| `--num_samples` | Only process this many images (sanity-check run) | — |
+| `--shuffle` / `--seed` | Shuffle image order with a fixed seed | off |
+| `--start_index` / `--end_index` | 0-based `[start, end)` slice of the image list — useful for splitting a large dataset across multiple runs/machines | — |
+| `--batch_size` | Images per batch; each finished batch is checkpointed so resumed runs can skip it | `0` (disabled) |
+| `--max_workers` | Thread-pool size for concurrent image processing (raise for remote APIs) | — |
+| `--resume` | Legacy per-file resume (skip if output `.txt` already exists) | off |
+| `--auto_resume` (default on) / `--no_auto_resume` | Resume from `<output_folder>/.checkpoint.json` after an interrupted run; pass `--no_auto_resume` to start fresh | on |
+
+### 4. YAML Config + CLI Overrides
+
+Any field on `PipelineConfig` can live in a YAML file loaded by `--config`.
+
+```yaml
+# pipeline.yaml
+max_rounds: 5
+score_threshold: 9
+categories: "crack, scratch, dent"
+output_folder: ./yaml_out
+auto_resume: false
+```
+
+```bash
+# YAML provides defaults; CLI flags override only what they explicitly set.
+uv run llmog --task free_detection --config pipeline.yaml -i img.jpg --max_rounds 2
+# → max_rounds == 2          (CLI won)
+# → score_threshold == 9      (from YAML)
+# → output_folder == ./yaml_out (from YAML)
+# → auto_resume == False      (from YAML)
 ```
 
 ---
 
 ## 📁 Output Structure
 
-For every image processed, a dedicated subdirectory is created under the output folder:
+### `free_detection` task
+
+For every image processed, a dedicated subdirectory is created under `--output_folder`:
+
 ```
 detection_results/
+├── summary.json             # Per-image status, best round + score
 └── [image_name]/
     ├── best_annotated.jpg    # Best annotated image with lime-green bounding boxes
     ├── best_detections.json  # Final parsed JSON detections
     └── history.json          # Complete round-by-round scores, detections, and feedback
 ```
 
+### `auto_label` task
+
+Relabeled `.txt` files (YOLO format with the discovered class IDs) plus a checkpoint and an updated `data.yaml`:
+
+```
+out/
+├── labels/                # (when not using --inplace_saving)
+│   ├── img_0001.txt
+│   └── ...
+├── .checkpoint.json       # Auto-resume state (only if --auto_resume is on)
+└── data.yaml               # Updated copy with the discovered class_map
+```
+
 ---
 
 ## 🛠️ Technology Stack
 
-* **Core Logic**: Python 3.12+, Pillow (PIL) for image manipulations, OpenCV (`opencv-python`) for CLAHE/Contour/Bilateral processing, Matplotlib for rendering.
-* **VLM Integrations**: OpenAI Python SDK (compatible with any OpenAI-style endpoint such as `llama-server`, vLLM, Ollama, etc. Supports custom payloads via `extra_body`).
-* **Web UI**: Gradio.
-* **Environment & Package Management**: `uv`, Setuptools.
+- **Core Logic**: Python 3.12+, Pillow (PIL) for image manipulation, OpenCV (`opencv-python`) for CLAHE/contour/bilateral processing, Matplotlib for rendering.
+- **VLM Integrations**: OpenAI Python SDK, compatible with any OpenAI-style endpoint (`llama-server`, vLLM, Ollama, etc.), with support for custom payloads via `extra_body`.
+- **Web UI**: Gradio.
+- **Environment & Package Management**: `uv`, Setuptools.
+
+---
+
+*Repository: [mohamed-em2m/llmog — framework for testing LLMs on object grounding](https://github.com/mohamed-em2m/llm-object-grounding)*

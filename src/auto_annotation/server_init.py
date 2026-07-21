@@ -71,30 +71,44 @@ def wait_for_server_health(port, timeout=1200, poll_interval=2.0):
 
 
 def init_server(args):
+    """Start a local llama.cpp or vLLM server and return its manager.
+
+    ``args`` may be a :class:`PipelineConfig` (pydantic) or an argparse
+    ``Namespace`` -- both expose the same field names.
+    """
+    extra_args = list(getattr(args, "extra_args", None) or [])
+    serving_extra = getattr(args, "serving_extra", {}) or {}
+
     if args.server_type == "llama_cpp":
-        manager = servers_factory[args.server_type](
-            model=args.model,
-            host="localhost",
-            port=args.port,
-            ctx_size=args.ctx_size,
-            parallel_slots=args.parallel_slots,
-            n_threads=-1,
-            gpu_layers=-1,
-            tensor_split="1,1",
-            main_gpu=0,
-            temp=0.1,
-            top_p=0.85,
-            top_k=24,
-            spec_type="draft-mtp" if args.use_mtp else "none",
-            spec_draft_n_max=4 if args.use_mtp else 0,
-            fa="auto",
-            enable_thinking=args.enable_thinking,
-            batch_size=1024,
-            ubatch_size=1024,
-            kv_cache_type="q4_0",
-            image_min_tokens=args.image_min_tokens,
-            image_max_tokens=args.image_max_tokens,
-        )
+        # Build kwargs from any user overrides first, then the structured
+        # PipelineConfig fields (so explicit fields win over --serving_extra).
+        kwargs = {
+            "model": args.model,
+            "host": "localhost",
+            "port": args.port,
+            "ctx_size": args.ctx_size,
+            "parallel_slots": args.parallel_slots,
+            "n_threads": -1,
+            "gpu_layers": -1,
+            "tensor_split": "1,1",
+            "main_gpu": 0,
+            "temp": 0.1,
+            "top_p": 0.85,
+            "top_k": 24,
+            "spec_type": "draft-mtp" if args.use_mtp else "none",
+            "spec_draft_n_max": 4 if args.use_mtp else 0,
+            "fa": "auto",
+            "enable_thinking": args.enable_thinking,
+            "batch_size": 1024,
+            "ubatch_size": 1024,
+            "kv_cache_type": "q4_0",
+            "image_min_tokens": args.image_min_tokens,
+            "image_max_tokens": args.image_max_tokens,
+        }
+        # User overrides win -- they are surfaced through serving_extra on
+        # PipelineConfig or via --serving_extra KEY=VALUE on the CLI.
+        kwargs.update({k: v for k, v in serving_extra.items() if v is not None})
+        manager = servers_factory[args.server_type](**kwargs)
         manager.start_llama_server()
     elif args.server_type == "vllm":
         manager = servers_factory[args.server_type](
@@ -114,6 +128,7 @@ def init_server(args):
             enable_prefix_caching=args.enable_prefix_caching,
             speculative_model=args.speculative_model,
             trust_remote_code=args.trust_remote_code,
+            extra_args=extra_args,
         )
         # vLLM manager surfaces its own readiness; still poll HTTP health before
         # handing the client back so callers have a single wait-for-ready contract.
@@ -137,6 +152,7 @@ def init_server(args):
 
 
 def init_vllm_server(args):
+    extra_args = list(getattr(args, "extra_args", None) or [])
     vllm_manager = servers_factory["vllm"](
         model=args.model,
         host="localhost",
@@ -157,7 +173,7 @@ def init_vllm_server(args):
         trust_remote_code=args.trust_remote_code,
         limit_mm_per_prompt=args.limit_mm_per_prompt,
         chat_template=args.chat_template,
-        extra_args=args.extra_args,
+        extra_args=extra_args,
     )
     vllm_manager.start_vllm_server()
     return vllm_manager

@@ -1,15 +1,26 @@
 from __future__ import annotations
 
-import argparse
-from typing import List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class PipelineConfig(BaseModel):
-    """Validated configuration for the unified relabeler / detector pipeline."""
+    """Validated configuration for the unified relabeler / detector pipeline.
+
+    A single config object drives every entry point in the project:
+
+      * ``task="free_detection"`` -> :func:`free_detection.main` runs the
+        detector/judge pipeline on explicit ``--image`` paths.
+      * ``task="auto_label"`` -> :func:`auto_annotation.main` relabels
+        binary YOLO defect/no-defect boxes into multi-class labels using a
+        folder of images + labels described by a ``data.yaml``.
+    """
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    # --- Task selection -----------------------------------------------------
+    task: Literal["free_detection", "auto_label"] = "free_detection"
 
     # --- Logging -----------------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
@@ -129,7 +140,9 @@ class PipelineConfig(BaseModel):
     prep_min_pixels: int = 200_704
     prep_max_pixels: int = 4_194_304
 
-    serving_extra: Optional[List[str]] = None
+    serving_extra: Dict[str, Any] = Field(default_factory=dict)
+    # Raw extra command-line tokens forwarded verbatim to vLLM (list[str]).
+    extra_args: Optional[List[str]] = None
 
     # ------------------------------------------------------------------ validators
     @field_validator("prep_tile_overlap")
@@ -160,18 +173,32 @@ class PipelineConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_input_source(self) -> "PipelineConfig":
-        """Either an explicit image list OR a train_image folder must be supplied."""
-        if not self.images and not self.train_image:
+        """Input source depends on the selected task.
+
+        ``free_detection`` requires one or more explicit ``--image`` paths.
+        ``auto_label`` requires a ``--train_image`` folder (and typically also
+        ``--train_label`` and ``--yaml_path``, but those are enforced by the
+        sub-entry-point, not the schema, so users can stage experiments).
+        """
+        if self.task == "free_detection" and not self.images:
             raise ValueError(
-                "Provide either --image (one or more) or --train_image (folder)."
+                "task='free_detection' requires at least one --image/-i path."
+            )
+        if self.task == "auto_label" and not self.train_image:
+            raise ValueError(
+                "task='auto_label' requires --train_image (folder of images)."
             )
         return self
 
     @property
-    def vllm(self):
+    def vllm(self) -> Dict[str, Any]:
+        """Build the kwarg dict consumed by :class:`VllmServerManager`.
 
-        args = self.serving_extra
-        # arguments for vllm
+        Always returns a freshly-built dict so the user-supplied
+        ``serving_extra`` is never mutated in place (which would otherwise
+        leak preview-specific overrides back into the config object).
+        """
+        args: Dict[str, Any] = dict(self.serving_extra or {})
         args["--tensor_split"] = self.tensor_parallel_size
         args["--pipeline_parallel_size"] = self.pipeline_parallel_size
         args["--dtype"] = self.dtype
@@ -191,17 +218,18 @@ class PipelineConfig(BaseModel):
         return args
 
     @property
-    def llama_cpp(self):
-        args = self.serving_extra
+    def llama_cpp(self) -> Dict[str, Any]:
+        """Build the kwarg dict consumed by :class:`LlamaServerManager`."""
+        args: Dict[str, Any] = dict(self.serving_extra or {})
 
         # 1. Base Model & Context Setup
         args["-m"] = self.model
-        args["--ctx-size"] = self.ctx_size if hasattr(self, "ctx_size") else 2048
-        args["--port"] = self.port if hasattr(self, "port") else 8080
+        args["--ctx-size"] = self.ctx_size
+        args["--port"] = self.port
 
         # 2. KV Cache Data Type Mapping
         # vLLM choice mapping (e.g., 'fp16', 'bf16', 'fp8', 'q8_0', 'q4_0')
-        if hasattr(self, "kv_cache_dtype") and self.kv_cache_dtype:
+        if self.kv_cache_dtype:
             # Standardize vLLM 'fp8' / 'auto' naming to typical llama.cpp cache types
             dtype_map = {
                 "fp16": "f16",
@@ -212,47 +240,38 @@ class PipelineConfig(BaseModel):
             }
             # Fallback directly to the string if user directly passed llama.cpp formats (e.g. 'q4_0')
             target_dtype = dtype_map.get(self.kv_cache_dtype, self.kv_cache_dtype)
-
-            args["--cache-type-k"] = target_dtype  # Configures Key cache type
-            args["--cache-type-v"] = target_dtype  # Configures Value cache type
+            if target_dtype != "auto":
+                args["--cache-type-k"] = target_dtype  # Key cache type
+                args["--cache-type-v"] = target_dtype  # Value cache type
 
         # 3. Concurrency & Queue Capacity
         # vLLM max_num_seqs determines simultaneously active request slots
-        args["--parallel"] = (
-            self.parallel_slots
-            if (hasattr(self, "parallel_slots") and self.parallel_slots)
-            else self.max_num_seqs
-        )
+        args["--parallel"] = self.parallel_slots if self.parallel_slots else self.max_num_seqs
 
         # 4. Multi-GPU Splitting & Execution Controls
         args["--gpu-layers"] = 999  # Mandate all layer processing offloads to GPU
-        if hasattr(self, "tensor_parallel_size") and self.tensor_parallel_size > 1:
+        if self.tensor_parallel_size > 1:
             args["--split-mode"] = "layer"
 
-        if hasattr(self, "enforce_eager") and self.enforce_eager:
-            # Flash Attention optimization toggle can be turned off if eager is enforced
-            args["--flash-attn"] = False
-        else:
-            args["--flash-attn"] = True
+        # Flash Attention optimization toggle is disabled when eager is enforced
+        args["--flash-attn"] = not self.enforce_eager
 
         # 5. Caching & Batch Strategies
-        if hasattr(self, "enable_prefix_caching") and self.enable_prefix_caching:
+        if self.enable_prefix_caching:
             args["--cont-batching"] = True  # Continuous batching handles reuse prompts
 
-        if hasattr(self, "enable_chunked_prefill") and self.enable_chunked_prefill:
+        if self.enable_chunked_prefill:
             args["--batch-size"] = 512  # Restricts chunk limits per step optimization
 
         # 6. Speculative Decoding Configurations
-        if hasattr(self, "speculative_model") and self.speculative_model:
+        if self.speculative_model:
             args["--model-draft"] = self.speculative_model  # Secondary draft model path
-            if hasattr(self, "num_speculative_tokens") and self.num_speculative_tokens:
+            if self.num_speculative_tokens:
                 args["--n-predict"] = self.num_speculative_tokens
 
         # 7. Modern Toggle Overrides (Reasoning & MTP)
-        if hasattr(self, "enable_thinking"):
-            args["--reasoning"] = "on" if self.enable_thinking else "off"
-
-        if hasattr(self, "use_mtp") and self.use_mtp:
+        args["--reasoning"] = "on" if self.enable_thinking else "off"
+        if self.use_mtp:
             args["--spec-type"] = "draft-mtp"
 
         return args
