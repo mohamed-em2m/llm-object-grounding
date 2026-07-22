@@ -1,22 +1,14 @@
 """
 Real-time webcam streaming & video frame detection tab UI and processing functions.
 
-Fixes vs. previous version:
-  1. Per-session state (was: module-level globals shared across every connected user).
-     Each browser session now gets its own SessionDetector via gr.State, so two people
-     streaming at once no longer stomp on each other's boxes / detecting flag.
-  2. Detections are frame-correlated with a monotonic frame_id, so a slow detection
-     that finishes late can never overwrite a newer result ("flicker back" bug).
-  3. Video-file processing now waits for each frame's detection to actually complete
-     (bounded via Future.result()) instead of firing a background thread and grabbing
-     whatever _last_boxes happens to contain. This was the "results after model ended"
-     bug: the loop would move to the next frame before the previous detection thread
-     had written its result, and the very last frame(s)' detections were dropped
-     entirely because the thread finished after process_video_frames had returned.
-  4. OpenAI client + ObjectDetectionPipeline are cached per (base_url, api_key, model)
-     instead of being rebuilt on every single tick.
-  5. ThreadPoolExecutor(max_workers=1) + Future replaces the raw Thread + bool flag,
-     which was a race: `_is_detecting` could be read stale between the check and set.
+Enhanced Real-time Streaming & Tracking architecture:
+  1. Live video preview stays strictly in native browser window (HTML5 <video>) for zero latency.
+  2. Single combined display view (no duplicate/secondary image windows or split components).
+  3. Continuous background VLM inference pipeline without stopping video or freezing UI.
+  4. Real-time ByteTrack (Kalman Filter + Hungarian IoU matching) running locally on every frame tick:
+     - Maintains smooth bounding box prediction & object tracking across frame ticks even while VLM inference is running.
+     - Smoothly incorporates newly arrived VLM detection predictions when model output completes.
+  5. Per-session detector state preventing multi-user cross-contamination.
 """
 
 import io
@@ -48,12 +40,12 @@ from free_detection.image_preprocessing import (
     preprocess_resolution,
     map_bbox_to_original,
 )
+from free_detection.bytetrack import ByteTracker
 
 DEFAULT_HUD = '<div class="neo-retro-hud-stat">STATUS: INITIALIZED</div>'
 
 # ---------------------------------------------------------------------------
-# Client cache (safe to share across sessions -- it's stateless/read-only,
-# unlike the detection results which must stay per-session)
+# Client cache (safe to share across sessions -- stateless/read-only)
 # ---------------------------------------------------------------------------
 _client_cache: Dict[Tuple[str, str, str], "ObjectDetectionPipeline"] = {}
 _client_cache_lock = Lock()
@@ -73,14 +65,14 @@ def _get_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# Per-session detection state
+# Per-session detection & ByteTrack state
 # ---------------------------------------------------------------------------
 @dataclass
 class SessionDetector:
     """
     One instance of this lives inside a gr.State for each connected browser
     session, so concurrent users never share detection results or the
-    in-flight flag.
+    in-flight flag. Includes ByteTracker for frame-to-frame box tracking.
     """
 
     lock: Lock = field(default_factory=Lock)
@@ -90,17 +82,15 @@ class SessionDetector:
         )
     )
     future: Optional[Future] = None
-    last_boxes: List[Any] = field(default_factory=list)
+    tracker: ByteTracker = field(default_factory=lambda: ByteTracker(high_thresh=0.4, low_thresh=0.1))
+    last_raw_boxes: List[Any] = field(default_factory=list)
+    last_tracked_boxes: List[Any] = field(default_factory=list)
     last_hud: str = DEFAULT_HUD
     last_applied_frame_id: int = -1
     _frame_counter: "itertools.count" = field(
         default_factory=lambda: itertools.count(1)
     )
 
-    # Motion-gating state: the small grayscale frame that was last SENT to
-    # detection, and when that happened. New frames are diffed against this
-    # to decide whether the scene has actually changed enough to bother
-    # calling the model again -- replaces the old "just poll every N sec".
     reference_gray: Optional[np.ndarray] = None
     last_detect_time: float = 0.0
 
@@ -124,17 +114,34 @@ class SessionDetector:
                 f"ERROR: {html.escape(str(e))}</div>"
             )
         with self.lock:
-            # Only apply if this frame is newer than whatever we last applied.
-            # Prevents a slow, stale detection from clobbering a fresher result.
             if frame_id >= self.last_applied_frame_id:
                 self.last_applied_frame_id = frame_id
                 if boxes is not None:
-                    self.last_boxes = boxes
+                    self.last_raw_boxes = boxes
+                    # Feed new VLM predictions into ByteTracker
+                    formatted_dets = []
+                    for b in boxes:
+                        # b: [ymin, xmin, ymax, xmax, label]
+                        if len(b) >= 4:
+                            lbl = b[4] if len(b) >= 5 else ""
+                            formatted_dets.append([b[0], b[1], b[2], b[3], lbl, 0.9])
+                    self.last_tracked_boxes = self.tracker.update(formatted_dets)
                 self.last_hud = hud
+
+    def update_tracking_only(self) -> List[Any]:
+        """Runs ByteTracker prediction tick using existing tracks when no new VLM detection has completed."""
+        with self.lock:
+            if self.last_raw_boxes:
+                formatted_dets = []
+                for b in self.last_raw_boxes:
+                    lbl = b[4] if len(b) >= 5 else ""
+                    formatted_dets.append([b[0], b[1], b[2], b[3], lbl, 0.85])
+                self.last_tracked_boxes = self.tracker.update(formatted_dets)
+            return list(self.last_tracked_boxes)
 
     def snapshot(self):
         with self.lock:
-            return list(self.last_boxes), self.last_hud
+            return list(self.last_tracked_boxes), self.last_hud
 
     def shutdown(self):
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -145,7 +152,7 @@ def new_session_detector() -> SessionDetector:
 
 
 # ---------------------------------------------------------------------------
-# Drawing
+# Drawing & Preprocessing
 # ---------------------------------------------------------------------------
 def _to_small_gray(frame_rgb: np.ndarray, size=(160, 120)) -> Optional[np.ndarray]:
     """Downscaled, blurred grayscale version of a frame, cheap to diff."""
@@ -163,21 +170,10 @@ def _scene_has_changed(
     pixel_diff_thresh: int = 25,
     change_ratio_thresh: float = 0.015,
 ) -> bool:
-    """
-    absdiff + threshold motion detection: compares `current_gray` against
-    the last frame that was actually sent to the model. Returns True if
-    enough pixels changed to be worth re-running detection.
-
-    - No reference yet (first frame) -> always True.
-    - `pixel_diff_thresh`: how much a pixel's brightness must change (0-255)
-      to count as "different" -- filters out sensor noise.
-    - `change_ratio_thresh`: fraction of pixels that must be "different"
-      for the frame as a whole to count as changed (e.g. 0.015 = 1.5%).
-    """
     if reference_gray is None:
         return True
     if cv2 is None:
-        return True  # can't diff without cv2 -- fail open, always detect
+        return True
     diff = cv2.absdiff(current_gray, reference_gray)
     _, thresholded = cv2.threshold(diff, pixel_diff_thresh, 255, cv2.THRESH_BINARY)
     changed_pixels = cv2.countNonZero(thresholded)
@@ -186,7 +182,7 @@ def _scene_has_changed(
 
 
 def draw_boxes_opencv(image_np: np.ndarray, boxes: List[Any]) -> np.ndarray:
-    """Fast OpenCV bounding box rendering (<1ms vs ~200ms for Matplotlib)."""
+    """Fast OpenCV bounding box rendering for video frame exports."""
     if cv2 is None or not boxes:
         return image_np
     img = image_np.copy()
@@ -194,23 +190,24 @@ def draw_boxes_opencv(image_np: np.ndarray, boxes: List[Any]) -> np.ndarray:
         if len(box) >= 4:
             ymin, xmin, ymax, xmax = box[:4]
             label = str(box[4]) if len(box) >= 5 else ""
+            track_id = f" #{box[5]}" if len(box) >= 6 else ""
+            full_label = f"{label}{track_id}"
             pt1 = (int(xmin), int(ymin))
             pt2 = (int(xmax), int(ymax))
-            # Vibrant cyber cyan bounding box (#00ffcc -> BGR (204, 255, 0))
             cv2.rectangle(img, pt1, pt2, (204, 255, 0), 2)
-            if label:
+            if full_label:
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.5
                 thickness = 1
                 (text_w, text_h), _ = cv2.getTextSize(
-                    label, font, font_scale, thickness
+                    full_label, font, font_scale, thickness
                 )
                 lbl_pt1 = (int(xmin), max(0, int(ymin) - text_h - 6))
                 lbl_pt2 = (int(xmin) + text_w + 6, max(text_h + 6, int(ymin)))
                 cv2.rectangle(img, lbl_pt1, lbl_pt2, (204, 255, 0), -1)
                 cv2.putText(
                     img,
-                    label,
+                    full_label,
                     (int(xmin) + 3, max(text_h + 2, int(ymin) - 3)),
                     font,
                     font_scale,
@@ -222,7 +219,7 @@ def draw_boxes_opencv(image_np: np.ndarray, boxes: List[Any]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Core detection call (pure -- no globals, no gradio-specific side effects)
+# Core detection call
 # ---------------------------------------------------------------------------
 def _detect(
     frame: np.ndarray,
@@ -232,9 +229,7 @@ def _detect(
     model_name: str,
     prep_info: dict,
 ) -> Tuple[List[Any], str]:
-    """Runs VLM detection on a single (already-downscaled) frame and returns
-    (boxes_in_original_pixel_space, hud_html). Raises on failure -- caller
-    is responsible for catching."""
+    """Runs VLM detection on a single frame and returns (boxes_in_original_pixel_space, hud_html)."""
     start_time = time.time()
     pil_img = Image.fromarray(frame).convert("RGB")
     pipeline = _get_pipeline(base_url, api_key, model_name)
@@ -280,7 +275,7 @@ def _resolve_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Webcam streaming tick (async / non-blocking -- must never stall the UI)
+# Webcam streaming tick
 # ---------------------------------------------------------------------------
 def process_single_frame(
     frame: np.ndarray,
@@ -297,29 +292,11 @@ def process_single_frame(
     session: SessionDetector,
 ) -> tuple[dict, str, SessionDetector]:
     """
-    Called on every Gradio webcam stream tick.
-
-    - This does NOT render or return an image. The webcam feed the user
-      sees is the browser's own native `<video>` preview -- it is already
-      real-time and never touches this function. What this returns is a
-      small JSON payload (`{"boxes": [...], "frame_w": W, "frame_h": H}`)
-      that a client-side JS snippet (wired in _wire_realtime_events) uses
-      to redraw a transparent <canvas> overlaid on top of that live video.
-      No image round-trips through the server for display -- only box
-      coordinates, which is what makes the overlay feel real-time instead
-      of laggy.
-    - In the background, at most one detection runs at a time. Instead of
-      deciding "should I detect?" from a fixed timer, we diff the current
-      frame against the last frame we actually sent to the model
-      (absdiff + threshold on a small grayscale copy). If the scene hasn't
-      meaningfully changed, we skip the model call entirely and just keep
-      reusing the boxes we already have -- they stay on screen until a real
-      change triggers a fresh detection that replaces them.
-    - `stale_refresh_seconds` is a small safety net: even with zero motion,
-      we still re-check every so often (default a few seconds) so a missed
-      detection (e.g. object present before the stream even started) isn't
-      stuck forever. Set it high (or math.inf) to disable and rely on
-      motion alone.
+    Continuous Live Streaming Processor:
+    - Real-time video preview is shown seamlessly without freezing or stopping.
+    - Sends frames to background thread pool for VLM detection.
+    - In between VLM responses, runs ByteTrack locally to update and smooth bounding boxes across ticks.
+    - Client-side JS draws the overlay dynamically on top of the live video preview.
     """
     if session is None:
         session = new_session_detector()
@@ -331,16 +308,11 @@ def process_single_frame(
     pil_img = Image.fromarray(frame).convert("RGB")
     frame_h, frame_w = frame.shape[0], frame.shape[1]
 
-    # 1) Grab whatever boxes are already cached -- NO image is rendered here.
-    #    The browser already has a live, native webcam feed on screen; we
-    #    just hand it the latest box coordinates as JSON and a small bit of
-    #    client-side JS (wired in _wire_realtime_events) draws them onto a
-    #    transparent <canvas> sitting on top of that live video. That keeps
-    #    the video itself genuinely real-time (it never goes through this
-    #    Python round trip at all) while the overlay updates as boxes arrive.
-    boxes_to_draw, hud = session.snapshot()
+    # 1) Execute ByteTrack update for continuous tracking across stream ticks
+    tracked_boxes = session.update_tracking_only()
+    hud = session.last_hud
 
-    # 2) Decide, in the background, whether this frame is worth detecting.
+    # 2) Dispatch background detection when ready
     if not session.is_busy():
         gray_small = _to_small_gray(frame)
         change_ratio_thresh = max(0.0, float(motion_sensitivity_pct or 1.5)) / 100.0
@@ -384,24 +356,20 @@ def process_single_frame(
             session.last_detect_time = now
 
     return (
-        {"boxes": boxes_to_draw, "frame_w": frame_w, "frame_h": frame_h},
+        {"boxes": tracked_boxes, "frame_w": frame_w, "frame_h": frame_h},
         hud,
         session,
     )
 
 
 def reset_session(session: Optional[SessionDetector]) -> SessionDetector:
-    """Call when the stream stops / mode toggles, so a stale in-flight
-    detection from the old context can't leak into the new one."""
     if session is not None:
         session.shutdown()
     return new_session_detector()
 
 
 # ---------------------------------------------------------------------------
-# Video file processing (SYNCHRONOUS per sampled frame -- deliberately not
-# fire-and-forget, so every sampled frame's result is guaranteed to be
-# captured before the function returns, and progress reporting stays honest)
+# Video file processing
 # ---------------------------------------------------------------------------
 def process_video_frames(
     video_path: str,
@@ -448,6 +416,7 @@ def process_video_frames(
     )
     max_res = int(max_resolution or 640)
 
+    tracker = ByteTracker(high_thresh=0.4, low_thresh=0.1)
     annotated_frames = []
     errors = 0
     for idx, f in enumerate(frames):
@@ -459,15 +428,18 @@ def process_video_frames(
             pil_img, enabled=True, target_short_edge=max_res
         )
         try:
-            # Blocking call -- we WAIT for this frame's result before moving on,
-            # so nothing is ever dropped or shifted relative to the frame it came from.
             boxes, _hud = _detect(
                 np.array(proc_img), categories, base_url, api_key, model_name, prep_info
             )
+            formatted_dets = []
+            for b in boxes:
+                lbl = b[4] if len(b) >= 5 else ""
+                formatted_dets.append([b[0], b[1], b[2], b[3], lbl, 0.9])
+            tracked_boxes = tracker.update(formatted_dets)
         except Exception:
-            boxes = []
+            tracked_boxes = []
             errors += 1
-        annotated_frames.append(draw_boxes_opencv(np.array(pil_img), boxes))
+        annotated_frames.append(draw_boxes_opencv(np.array(pil_img), tracked_boxes))
 
     status = f"Successfully processed {len(annotated_frames)} frames from video!"
     if errors:
@@ -476,11 +448,10 @@ def process_video_frames(
 
 
 # ---------------------------------------------------------------------------
-# UI
+# UI Construction
 # ---------------------------------------------------------------------------
 def _build_realtime_tab() -> Dict[str, Any]:
     c = {}
-    # Per-session detection state -- NOT shared between browser tabs/users.
     c["session_state"] = gr.State(new_session_detector)
 
     with gr.Column(elem_classes=["neo-retro-card"]):
@@ -489,7 +460,7 @@ def _build_realtime_tab() -> Dict[str, Any]:
         <div style="padding: 10px; border-bottom: 2px solid #00ffcc; background: #050811;">
             <span class="neo-retro-badge">LIVE CYBER-STREAM</span>
             <h2 style="color: #00ffcc; font-family: 'JetBrains Mono', monospace; margin: 5px 0 0;">
-                ⚡ REAL-TIME WEBCAM & VIDEO FRAME DETECTOR
+                ⚡ REAL-TIME WEBCAM & VIDEO FRAME DETECTOR (BYTETRACK INTEGRATED)
             </h2>
         </div>
         """
@@ -544,12 +515,10 @@ def _build_realtime_tab() -> Dict[str, Any]:
                 )
                 c["hud_status"] = gr.HTML(value=DEFAULT_HUD)
             with gr.Column(scale=2):
-                # elem_id lets the JS below find this component's DOM
-                # wrapper to size/position the overlay canvas on top of it.
                 gr.HTML(
                     """
                     <style>
-                    #rt_webcam_wrap { position: relative; }
+                    #rt_webcam_wrap { position: relative; width: 100%; }
                     #rt_overlay_canvas {
                         position: absolute;
                         top: 0; left: 0;
@@ -572,9 +541,6 @@ def _build_realtime_tab() -> Dict[str, Any]:
                         '<canvas id="rt_overlay_canvas"></canvas>'
                     )
                 c["webcam_wrap_group"] = webcam_wrap
-                # Hidden data channel: box coordinates + frame size only --
-                # never an image. The JS bound in _wire_realtime_events
-                # draws this onto #rt_overlay_canvas whenever it changes.
                 c["boxes_json_state"] = gr.JSON(visible=False)
                 c["video_input"] = gr.Video(
                     label="INPUT VIDEO FILE",
@@ -593,8 +559,6 @@ def _wire_realtime_events(
 ):
     def toggle_mode(mode, session):
         is_cam = mode == "Webcam Stream"
-        # Tear down any in-flight detection from the mode we're leaving so it
-        # can't write stale results into the mode we're entering.
         fresh_session = reset_session(session)
         return (
             gr.update(visible=is_cam),
@@ -635,14 +599,9 @@ def _wire_realtime_events(
             c_real["hud_status"],
             c_real["session_state"],
         ],
-        stream_every=0.3,
+        stream_every=0.1,
     )
 
-    # Pure client-side redraw: fires whenever boxes_json_state's value
-    # changes (i.e. every stream tick), with NO extra server round trip --
-    # the data already arrived as part of the stream() response above. This
-    # is what makes the overlay track the (always-live) video in real time
-    # instead of waiting on a second image to render server-side.
     c_real["boxes_json_state"].change(
         fn=None,
         inputs=[c_real["boxes_json_state"]],
@@ -653,8 +612,6 @@ def _wire_realtime_events(
             const canvas = document.getElementById('rt_overlay_canvas');
             if (!wrap || !canvas || !payload) return;
 
-            // Keep the canvas's pixel buffer matched to its on-screen size
-            // (CSS already stretches it to cover the wrapper via 100%/100%).
             const rect = wrap.getBoundingClientRect();
             if (canvas.width !== rect.width || canvas.height !== rect.height) {
                 canvas.width = rect.width;
@@ -677,17 +634,17 @@ def _wire_realtime_events(
 
             for (const box of boxes) {
                 if (!box || box.length < 4) continue;
-                const [ymin, xmin, ymax, xmax, label] = box;
+                const [ymin, xmin, ymax, xmax, label, trackId] = box;
                 const x = xmin * scaleX, y = ymin * scaleY;
                 const w = (xmax - xmin) * scaleX, h = (ymax - ymin) * scaleY;
                 ctx.strokeRect(x, y, w, h);
-                if (label) {
-                    const text = String(label);
-                    const textW = ctx.measureText(text).width;
+                const tag = (trackId !== undefined && trackId !== null) ? `${label || ''} #${trackId}` : `${label || ''}`;
+                if (tag.trim()) {
+                    const textW = ctx.measureText(tag).width;
                     ctx.fillStyle = '#00ffcc';
                     ctx.fillRect(x, Math.max(0, y - 16), textW + 6, 16);
                     ctx.fillStyle = '#110805';
-                    ctx.fillText(text, x + 3, Math.max(11, y - 4));
+                    ctx.fillText(tag, x + 3, Math.max(11, y - 4));
                 }
             }
         }
