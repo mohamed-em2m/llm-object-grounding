@@ -69,10 +69,10 @@ MODEL_PRESETS = [
 ]
 
 _STATUS_PILL = {
-    "queued":    '<span class="img-status-pill pill-queued">QUEUED</span>',
-    "running":   '<span class="img-status-pill pill-running">RUNNING</span>',
-    "done":      '<span class="img-status-pill pill-done">DONE</span>',
-    "error":     '<span class="img-status-pill pill-error">ERROR</span>',
+    "queued": '<span class="img-status-pill pill-queued">QUEUED</span>',
+    "running": '<span class="img-status-pill pill-running">RUNNING</span>',
+    "done": '<span class="img-status-pill pill-done">DONE</span>',
+    "error": '<span class="img-status-pill pill-error">ERROR</span>',
     "cancelled": '<span class="img-status-pill pill-cancelled">CANCELLED</span>',
 }
 
@@ -159,7 +159,9 @@ def _tail(s: str, n: int = LOG_TAIL_BYTES) -> str:
 DISPLAY_MAX_PX = 1280  # max long-edge pixels sent to the browser
 
 
-def _thumb(img: Optional[Image.Image], max_px: int = DISPLAY_MAX_PX) -> Optional[Image.Image]:
+def _thumb(
+    img: Optional[Image.Image], max_px: int = DISPLAY_MAX_PX
+) -> Optional[Image.Image]:
     """Return a display-sized copy of *img* so large images don't stall the UI."""
     if img is None:
         return None
@@ -205,7 +207,7 @@ def start_server_wrapper(
     image_max_tokens,
     parallel_slots,
     batch_size,
-    ubatch_size
+    ubatch_size,
 ):
     ctx_size = ctx_size * parallel_slots
     global server_manager
@@ -353,6 +355,7 @@ def get_server_status_and_logs():
 
 class PipelineCancelledException(Exception):
     """Raised when a user cancels the pipeline mid-run."""
+
     pass
 
 
@@ -464,12 +467,16 @@ def run_batch_detection_gui(
     )
 
     if not image_files:
-        yield "Error: Please upload at least one image.", _render_progress_bar(0), *_empty_yield
+        yield "Error: Please upload at least one image.", _render_progress_bar(
+            0
+        ), *_empty_yield
         return
 
     categories = [c.strip() for c in categories_str.split(",") if c.strip()]
     if not categories:
-        yield "Error: Please list at least one category.", _render_progress_bar(0), *_empty_yield
+        yield "Error: Please list at least one category.", _render_progress_bar(
+            0
+        ), *_empty_yield
         return
 
     image_paths: List[Path] = []
@@ -481,7 +488,9 @@ def run_batch_detection_gui(
         elif isinstance(f, dict) and "name" in f:
             image_paths.append(Path(f["name"]))
     if not image_paths:
-        yield "Error: Could not resolve uploaded files.", _render_progress_bar(0), *_empty_yield
+        yield "Error: Could not resolve uploaded files.", _render_progress_bar(
+            0
+        ), *_empty_yield
         return
 
     cleaned_paths: List[Path] = []
@@ -491,13 +500,17 @@ def run_batch_detection_gui(
                 im.verify()
             cleaned_paths.append(p)
         except Exception as e:
-            yield f"Error: file '{p.name}' is not a valid image ({e}).", _render_progress_bar(0), *_empty_yield
+            yield f"Error: file '{p.name}' is not a valid image ({e}).", _render_progress_bar(
+                0
+            ), *_empty_yield
             return
     image_paths = cleaned_paths
 
     concurrency = max(1, int(concurrency or DEFAULT_CONCURRENCY))
 
-    yield "Initializing API clients...", _render_progress_bar(2, "Initializing..."), None, "", gr.update(choices=[]), "", _render_status_table({}, [])
+    yield "Initializing API clients...", _render_progress_bar(
+        2, "Initializing..."
+    ), None, "", gr.update(choices=[]), "", _render_status_table({}, [])
 
     if use_external_api:
         api_url, api_key, model_name = ext_api_url, ext_api_key, ext_model_name
@@ -505,14 +518,22 @@ def run_batch_detection_gui(
             yield (
                 "Error: External API selected but no API key provided. "
                 "Set one in the External API section."
-            ), _render_progress_bar(0, "Error"), None, "", gr.update(choices=[]), "", _render_status_table({}, [])
+            ), _render_progress_bar(0, "Error"), None, "", gr.update(
+                choices=[]
+            ), "", _render_status_table(
+                {}, []
+            )
             return
     else:
         with server_lock:
             if server_manager is None or not server_manager.is_healthy():
                 yield "Error: Local server not running. Start it on the Server tab or enable External API.", _render_progress_bar(
                     0, "Error"
-                ), None, "", gr.update(choices=[]), "", _render_status_table({}, [])
+                ), None, "", gr.update(
+                    choices=[]
+                ), "", _render_status_table(
+                    {}, []
+                )
                 return
             port = server_manager.port
             model_name = server_manager.model
@@ -528,7 +549,9 @@ def run_batch_detection_gui(
         )
         client = OpenAI(base_url=api_url, api_key=api_key, http_client=http_client)
     except Exception as e:
-        yield f"Error initializing OpenAI client: {e}", _render_progress_bar(0, "Error"), None, "", gr.update(choices=[]), "", _render_status_table({}, [])
+        yield f"Error initializing OpenAI client: {e}", _render_progress_bar(
+            0, "Error"
+        ), None, "", gr.update(choices=[]), "", _render_status_table({}, [])
         return
 
     batch_id = str(int(time.time()))
@@ -708,7 +731,7 @@ def run_batch_detection_gui(
                 preprocessing_config=prep_config,
                 judge_enable_thinking=judge_thinking,
                 feedback_image_mode=feedback_image_mode,
-                external_api=use_external_api
+                external_api=use_external_api,
             )
 
             best, _history = pipeline.run(
@@ -1009,7 +1032,9 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
         )
 
     img_data = batch_results[selected_image]
-    src_img = _thumb(img_data["grid_original"] if show_grid else img_data["raw_original"])
+    src_img = _thumb(
+        img_data["grid_original"] if show_grid else img_data["raw_original"]
+    )
 
     if not selected_round or selected_round == "Final Best":
         best_annotated = img_data["best_annotated"]
@@ -1118,7 +1143,9 @@ def _build_server_tab(server_status_badge):
     with gr.Row(equal_height=False):
         # ── Left: Config ──────────────────────────────────────────────────
         with gr.Column(scale=2):
-            gr.HTML('<div class="config-card"><div class="config-card-title">🦙 Model Selection</div>')
+            gr.HTML(
+                '<div class="config-card"><div class="config-card-title">🦙 Model Selection</div>'
+            )
             server_preset = gr.Dropdown(
                 label="Recommended Model Presets",
                 choices=MODEL_PRESETS,
@@ -1131,9 +1158,11 @@ def _build_server_tab(server_status_badge):
                 placeholder="e.g. C:/models/qwen.gguf or HF ID",
                 interactive=True,
             )
-            gr.HTML('</div>')
+            gr.HTML("</div>")
 
-            gr.HTML('<div class="config-card"><div class="config-card-title">⚙️ Runtime Options</div>')
+            gr.HTML(
+                '<div class="config-card"><div class="config-card-title">⚙️ Runtime Options</div>'
+            )
             server_port_input = gr.Number(
                 label="Port Number",
                 value=8080,
@@ -1149,13 +1178,11 @@ def _build_server_tab(server_status_badge):
                     value=True,
                     interactive=True,
                 )
-            gr.HTML('</div>')
+            gr.HTML("</div>")
 
             with gr.Accordion("Advanced Server Parameters", open=False):
                 gr.HTML(_section_title("🖧", "Network"))
-                server_host_input = gr.Textbox(
-                    label="Host Binding", value="0.0.0.0"
-                )
+                server_host_input = gr.Textbox(label="Host Binding", value="0.0.0.0")
                 gr.HTML(_section_title("🎛️", "Compute"))
                 server_ctx_input = gr.Number(
                     label="Context Size per Slot",
@@ -1177,8 +1204,15 @@ def _build_server_tab(server_status_badge):
                 server_kv_cache = gr.Dropdown(
                     label="KV Cache Type",
                     choices=[
-                        "f32", "f16", "bf16", "q8_0",
-                        "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+                        "f32",
+                        "f16",
+                        "bf16",
+                        "q8_0",
+                        "q4_0",
+                        "q4_1",
+                        "iq4_nl",
+                        "q5_0",
+                        "q5_1",
                     ],
                     value="q4_0",
                 )
@@ -1199,9 +1233,7 @@ def _build_server_tab(server_status_badge):
 
             gr.HTML('<div class="btn-group" style="margin-top:0.75rem;">')
             with gr.Row():
-                start_server_btn = gr.Button(
-                    "▶  Start Server", variant="primary"
-                )
+                start_server_btn = gr.Button("▶  Start Server", variant="primary")
                 stop_server_btn = gr.Button(
                     "⏹  Stop Server", variant="secondary", size="sm"
                 )
@@ -1210,7 +1242,7 @@ def _build_server_tab(server_status_badge):
                     variant="secondary",
                     size="sm",
                 )
-            gr.HTML('</div>')
+            gr.HTML("</div>")
 
         # ── Right: Logs ───────────────────────────────────────────────────
         with gr.Column(scale=3):
@@ -1287,19 +1319,31 @@ def _build_batch_tab():
             with gr.Accordion("Pipeline Parameters", open=False):
                 rounds_slider = gr.Slider(
                     label="Optimization Max Rounds",
-                    minimum=1, maximum=5, step=1, value=1,
+                    minimum=1,
+                    maximum=5,
+                    step=1,
+                    value=1,
                 )
                 score_threshold_slider = gr.Slider(
                     label="Stop Score Threshold (0-10)",
-                    minimum=0, maximum=10, step=1, value=8,
+                    minimum=0,
+                    maximum=10,
+                    step=1,
+                    value=8,
                 )
                 det_temp_slider = gr.Slider(
                     label="Detector Temperature",
-                    minimum=0.0, maximum=1.5, step=0.05, value=0.9,
+                    minimum=0.0,
+                    maximum=1.5,
+                    step=0.05,
+                    value=0.9,
                 )
                 jdg_temp_slider = gr.Slider(
                     label="Judge Temperature",
-                    minimum=0.0, maximum=1.5, step=0.05, value=0.2,
+                    minimum=0.0,
+                    maximum=1.5,
+                    step=0.05,
+                    value=0.2,
                 )
                 judge_thinking_chk = gr.Checkbox(
                     label="Enable Judge Thinking Mode",
@@ -1324,7 +1368,10 @@ def _build_batch_tab():
                     gr.HTML(_section_title("📐", "Resolution & Padding"))
                     prep_short_edge_slider = gr.Slider(
                         label="Target Short Edge (px)",
-                        minimum=512, maximum=2048, step=128, value=1024,
+                        minimum=512,
+                        maximum=2048,
+                        step=128,
+                        value=1024,
                         info="Upscale short edge to at least this value.",
                     )
                     prep_pad_square_chk = gr.Checkbox(
@@ -1341,10 +1388,14 @@ def _build_batch_tab():
                     )
                     with gr.Row(visible=False) as prep_custom_resize_row:
                         prep_custom_resize_width = gr.Number(
-                            label="Target Width (px)", value=1024, precision=0,
+                            label="Target Width (px)",
+                            value=1024,
+                            precision=0,
                         )
                         prep_custom_resize_height = gr.Number(
-                            label="Target Height (px)", value=1024, precision=0,
+                            label="Target Height (px)",
+                            value=1024,
+                            precision=0,
                         )
 
                     gr.HTML(_section_title("🎨", "Contrast & Color"))
@@ -1355,10 +1406,14 @@ def _build_batch_tab():
                     )
                     prep_gamma_slider = gr.Slider(
                         label="Gamma Correction",
-                        minimum=0.5, maximum=2.0, step=0.05, value=1.0,
+                        minimum=0.5,
+                        maximum=2.0,
+                        step=0.05,
+                        value=1.0,
                     )
                     prep_wb_chk = gr.Checkbox(
-                        label="Gray World White Balance Correction", value=False,
+                        label="Gray World White Balance Correction",
+                        value=False,
                     )
 
                     gr.HTML(_section_title("🔇", "Noise & Sharpness"))
@@ -1380,43 +1435,86 @@ def _build_batch_tab():
                     )
                     prep_grid_step_slider = gr.Slider(
                         label="Grid Step Size (px)",
-                        minimum=20, maximum=500, step=10, value=250,
+                        minimum=20,
+                        maximum=500,
+                        step=10,
+                        value=250,
                         info="Distance between grid lines.",
                     )
                     prep_grid_line_width_slider = gr.Slider(
                         label="Grid Line Thickness (px)",
-                        minimum=1, maximum=10, step=1, value=1,
+                        minimum=1,
+                        maximum=10,
+                        step=1,
+                        value=1,
                     )
                     prep_grid_font_size_slider = gr.Slider(
                         label="Grid Label Font Size (0 = Auto)",
-                        minimum=0, maximum=48, step=1, value=0,
+                        minimum=0,
+                        maximum=48,
+                        step=1,
+                        value=0,
                     )
                     with gr.Row():
                         prep_grid_line_color_dropdown = gr.Dropdown(
                             label="Grid Line Color",
-                            choices=["red","blue","green","white","black","yellow","cyan","magenta","custom"],
+                            choices=[
+                                "red",
+                                "blue",
+                                "green",
+                                "white",
+                                "black",
+                                "yellow",
+                                "cyan",
+                                "magenta",
+                                "custom",
+                            ],
                             value="red",
                         )
                         prep_grid_line_color_custom = gr.Textbox(
-                            label="Custom Line Color (Hex/Name)", value="red", visible=False,
+                            label="Custom Line Color (Hex/Name)",
+                            value="red",
+                            visible=False,
                         )
                     with gr.Row():
                         prep_grid_text_color_dropdown = gr.Dropdown(
                             label="Grid Text Color",
-                            choices=["white","black","red","blue","green","yellow","cyan","magenta","custom"],
+                            choices=[
+                                "white",
+                                "black",
+                                "red",
+                                "blue",
+                                "green",
+                                "yellow",
+                                "cyan",
+                                "magenta",
+                                "custom",
+                            ],
                             value="white",
                         )
                         prep_grid_text_color_custom = gr.Textbox(
-                            label="Custom Text Color (Hex/Name)", value="white", visible=False,
+                            label="Custom Text Color (Hex/Name)",
+                            value="white",
+                            visible=False,
                         )
                     with gr.Row():
                         prep_grid_backing_color_dropdown = gr.Dropdown(
                             label="Grid Text Backing Color",
-                            choices=["black","none","white","red","blue","green","custom"],
+                            choices=[
+                                "black",
+                                "none",
+                                "white",
+                                "red",
+                                "blue",
+                                "green",
+                                "custom",
+                            ],
                             value="black",
                         )
                         prep_grid_backing_color_custom = gr.Textbox(
-                            label="Custom Backing (Hex/Name)", value="black", visible=False,
+                            label="Custom Backing (Hex/Name)",
+                            value="black",
+                            visible=False,
                         )
 
                     gr.HTML(_section_title("🎯", "Visual Prompting (SoM)"))
@@ -1433,10 +1531,18 @@ def _build_batch_tab():
                         info="Split image into overlapping tiles, detect independently, and merge via NMS.",
                     )
                     prep_tile_size_slider = gr.Slider(
-                        label="Tile Size (px)", minimum=256, maximum=1024, step=128, value=512,
+                        label="Tile Size (px)",
+                        minimum=256,
+                        maximum=1024,
+                        step=128,
+                        value=512,
                     )
                     prep_tile_overlap_slider = gr.Slider(
-                        label="Tile Overlap (%)", minimum=0, maximum=50, step=5, value=20,
+                        label="Tile Overlap (%)",
+                        minimum=0,
+                        maximum=50,
+                        step=5,
+                        value=20,
                     )
 
                     gr.HTML(_section_title("🔍", "Multi-Pass Crop & Verify"))
@@ -1446,7 +1552,11 @@ def _build_batch_tab():
                         info="Perform a second VLM validation pass on cropped detections.",
                     )
                     prep_cv_padding_slider = gr.Slider(
-                        label="Crop Context Padding (%)", minimum=0, maximum=50, step=5, value=15,
+                        label="Crop Context Padding (%)",
+                        minimum=0,
+                        maximum=50,
+                        step=5,
+                        value=15,
                     )
 
                     gr.HTML(_section_title("📡", "VLM Processor Pixel Bounds"))
@@ -1457,10 +1567,16 @@ def _build_batch_tab():
                     )
                     with gr.Row(visible=False) as prep_pixel_bounds_row:
                         prep_min_pixels_num = gr.Number(
-                            label="min_pixels", value=200704, precision=0, info="Default: 256×28×28",
+                            label="min_pixels",
+                            value=200704,
+                            precision=0,
+                            info="Default: 256×28×28",
                         )
                         prep_max_pixels_num = gr.Number(
-                            label="max_pixels", value=4194304, precision=0, info="Default: 2048×2048",
+                            label="max_pixels",
+                            value=4194304,
+                            precision=0,
+                            info="Default: 2048×2048",
                         )
 
             use_external_api_chk = gr.Checkbox(
@@ -1468,10 +1584,17 @@ def _build_batch_tab():
                 value=False,
                 info="When enabled, all requests are sent to the external endpoint below instead of the local llama-server.",
             )
-            with gr.Accordion("External API Settings", open=False, visible=False) as ext_api_group:
-                ext_api_url = gr.Textbox(label="Base URL", value="https://api.openai.com/v1")
+            with gr.Accordion(
+                "External API Settings", open=False, visible=False
+            ) as ext_api_group:
+                ext_api_url = gr.Textbox(
+                    label="Base URL", value="https://api.openai.com/v1"
+                )
                 ext_api_key = gr.Textbox(
-                    label="API Key", placeholder="sk-...", value="", type="password",
+                    label="API Key",
+                    placeholder="sk-...",
+                    value="",
+                    type="password",
                 )
                 ext_model_name = gr.Textbox(label="Model Name", value="gpt-4o")
 
@@ -1483,7 +1606,10 @@ def _build_batch_tab():
                         "high values just queue at the server. Set 8–32 for external APIs "
                         "or multi-slot servers."
                     ),
-                    minimum=1, maximum=64, step=1, value=DEFAULT_CONCURRENCY,
+                    minimum=1,
+                    maximum=64,
+                    step=1,
+                    value=DEFAULT_CONCURRENCY,
                 )
 
             gr.HTML('<div class="btn-group" style="margin-top:0.75rem;">')
@@ -1499,7 +1625,7 @@ def _build_batch_tab():
                     size="sm",
                     interactive=False,
                 )
-            gr.HTML('</div>')
+            gr.HTML("</div>")
 
         # ── Right: Results ────────────────────────────────────────────────
         with gr.Column(scale=3, min_width=600):
@@ -1547,13 +1673,13 @@ def _build_batch_tab():
                             source_image_viewer = gr.Image(
                                 label="Source Image", type="pil"
                             )
-                            gr.HTML('</div>')
+                            gr.HTML("</div>")
                         with gr.Column(scale=1):
                             gr.HTML('<div class="img-viewer-wrap">')
                             best_annotated_viewer = gr.Image(
                                 label="Annotated Image", type="pil"
                             )
-                            gr.HTML('</div>')
+                            gr.HTML("</div>")
 
                     round_feedback_display = gr.Textbox(
                         label="Judge's Feedback", lines=4, interactive=False
@@ -1678,12 +1804,12 @@ def _build_prompts_tab():
     )
     gr.HTML(
         '<div class="input-hint">'
-        'Template variables: '
+        "Template variables: "
         '<span class="hint-var">{categories}</span> '
         '<span class="hint-var">{category_definitions}</span> '
         '<span class="hint-var">{feedback}</span> '
         '<span class="hint-var">{detections_json}</span>'
-        '</div>'
+        "</div>"
     )
 
     customize_prompts_chk = gr.Checkbox(
@@ -1767,9 +1893,12 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
     )
 
     for dd, custom_field in [
-        (c_bat["prep_grid_line_color_dropdown"],    c_bat["prep_grid_line_color_custom"]),
-        (c_bat["prep_grid_text_color_dropdown"],    c_bat["prep_grid_text_color_custom"]),
-        (c_bat["prep_grid_backing_color_dropdown"], c_bat["prep_grid_backing_color_custom"]),
+        (c_bat["prep_grid_line_color_dropdown"], c_bat["prep_grid_line_color_custom"]),
+        (c_bat["prep_grid_text_color_dropdown"], c_bat["prep_grid_text_color_custom"]),
+        (
+            c_bat["prep_grid_backing_color_dropdown"],
+            c_bat["prep_grid_backing_color_custom"],
+        ),
     ]:
         dd.change(toggle_custom_color_field, inputs=[dd], outputs=[custom_field])
 
@@ -1779,9 +1908,11 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
         outputs=[c_bat["prep_pixel_bounds_row"]],
     )
 
+
 # ---------------------------------------------------------------------------
 # Real-Time Webcam & Video Frame Detection (Neo-Retro Style)
 # ---------------------------------------------------------------------------
+
 
 def process_single_frame(
     frame: np.ndarray,
@@ -1803,12 +1934,14 @@ def process_single_frame(
         if not categories:
             categories = ["object"]
 
-        base_url = ext_api_url if use_external_api else f"http://127.0.0.1:{server_port}/v1"
+        base_url = (
+            ext_api_url if use_external_api else f"http://127.0.0.1:{server_port}/v1"
+        )
         api_key = ext_api_key if use_external_api else "no-key"
         model_name = ext_model_name if use_external_api else "local-model"
 
         client = OpenAI(base_url=base_url, api_key=api_key)
-        pipeline = ObjectDetectionPipeline(client=client, model=model_name)
+        pipeline = ObjectDetectionPipeline(client=client, detector_model=model_name)
 
         boxes, _ = pipeline.detect_objects(
             image=pil_img,
@@ -1816,22 +1949,26 @@ def process_single_frame(
             temperature=0.2,
         )
 
-        annotated_img = draw_grid(pil_img, grid_type="none")
+        annotated_img = draw_grid(pil_img, style="none")
         annotated_np = draw_boxes_on_image(annotated_img, boxes)
 
         elapsed = (time.time() - start_time) * 1000
         hud_info = (
             f'<div class="neo-retro-hud-stat">FPS: {1000/max(elapsed, 1):.1f} | '
-            f'LATENCY: {elapsed:.0f}ms | DETECTED: {len(boxes)}</div>'
+            f"LATENCY: {elapsed:.0f}ms | DETECTED: {len(boxes)}</div>"
         )
         return annotated_np, hud_info
     except Exception as e:
-        return frame, f'<div class="neo-retro-hud-stat" style="color:#ff0055 !important;">ERROR: {html.escape(str(e))}</div>'
+        return (
+            frame,
+            f'<div class="neo-retro-hud-stat" style="color:#ff0055 !important;">ERROR: {html.escape(str(e))}</div>',
+        )
 
 
 def draw_boxes_on_image(image: Image.Image, boxes: List[Any]) -> np.ndarray:
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
+
     fig, ax = plt.subplots(figsize=(image.width / 100, image.height / 100), dpi=100)
     ax.imshow(image)
     ax.axis("off")
@@ -1858,7 +1995,9 @@ def draw_boxes_on_image(image: Image.Image, boxes: List[Any]) -> np.ndarray:
                     color="#050811",
                     fontsize=10,
                     fontweight="bold",
-                    bbox=dict(boxstyle="square,pad=0.2", facecolor="#00ffcc", edgecolor="none"),
+                    bbox=dict(
+                        boxstyle="square,pad=0.2", facecolor="#00ffcc", edgecolor="none"
+                    ),
                 )
 
     buf = io.BytesIO()
@@ -1884,6 +2023,7 @@ def process_video_frames(
         return [], "No video file uploaded."
 
     import cv2
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return [], "Failed to open video file."
@@ -1904,30 +2044,42 @@ def process_video_frames(
     cap.release()
 
     annotated_frames = []
-    
+
     for idx, f in enumerate(frames):
         progress((idx + 1) / len(frames), desc=f"Detecting frame {idx+1}/{len(frames)}")
         ann, _ = process_single_frame(
-            f, categories_str, server_port, use_external_api, ext_api_url, ext_api_key, ext_model_name, 0.3
+            f,
+            categories_str,
+            server_port,
+            use_external_api,
+            ext_api_url,
+            ext_api_key,
+            ext_model_name,
+            0.3,
         )
         if ann is not None:
             annotated_frames.append(ann)
 
-    return annotated_frames, f"Successfully processed {len(annotated_frames)} frames from video!"
+    return (
+        annotated_frames,
+        f"Successfully processed {len(annotated_frames)} frames from video!",
+    )
 
 
 def _build_realtime_tab() -> Dict[str, Any]:
     c = {}
     with gr.Column(elem_classes=["neo-retro-card"]):
-        gr.HTML("""
+        gr.HTML(
+            """
         <div style="padding: 10px; border-bottom: 2px solid #00ffcc; background: #050811;">
             <span class="neo-retro-badge">LIVE CYBER-STREAM</span>
             <h2 style="color: #00ffcc; font-family: 'JetBrains Mono', monospace; margin: 5px 0 0;">
                 ⚡ REAL-TIME WEBCAM & VIDEO FRAME DETECTOR
             </h2>
         </div>
-        """)
-        
+        """
+        )
+
         with gr.Row():
             with gr.Column(scale=1):
                 c["stream_mode"] = gr.Radio(
@@ -1979,7 +2131,13 @@ def _build_realtime_tab() -> Dict[str, Any]:
     return c
 
 
-def _wire_realtime_events(c_real: Dict[str, Any], c_srv: Dict[str, Any], c_bat: Dict[str, Any]):
+def _wire_realtime_events(
+    c_real: Dict[str, Any],
+    c_srv: Dict[str, Any],
+    c_bat: Dict[str, Any],
+    c_pmt: Dict[str, Any],
+    batch_id_state,
+):
     def toggle_mode(mode):
         is_cam = mode == "Webcam Stream"
         return (
@@ -2030,7 +2188,6 @@ def _wire_realtime_events(c_real: Dict[str, Any], c_srv: Dict[str, Any], c_bat: 
         ],
         outputs=[c_real["video_gallery_output"], c_real["hud_status"]],
     )
-
 
     # ── External API toggle ───────────────────────────────────────────────
     c_bat["use_external_api_chk"].change(
@@ -2181,7 +2338,8 @@ def build_app() -> gr.Blocks:
         gr.HTML(CONSOLE_JS)
 
         # ── Header with inline status badge ──────────────────────────────
-        gr.HTML("""
+        gr.HTML(
+            """
         <div class="app-header">
             <div>
                 <h1><span>🔍</span> LLM Object Detection Console</h1>
@@ -2189,7 +2347,8 @@ def build_app() -> gr.Blocks:
             </div>
             <div class="app-header-meta" id="header-status-meta">
             </div>
-        </div>""")
+        </div>"""
+        )
 
         server_status_badge = gr.HTML(
             value='<span class="status-badge badge-stopped">STOPPED</span>',
@@ -2212,7 +2371,7 @@ def build_app() -> gr.Blocks:
 
         # ── Wire all events ───────────────────────────────────────────────
         _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state)
-        _wire_realtime_events(c_real, c_srv, c_bat)
+        _wire_realtime_events(c_real, c_srv, c_bat, c_pmt, batch_id_state)
 
         # ── Auto-refresh server status every 5 s ─────────────────────────
         status_timer = gr.Timer(value=5.0)
