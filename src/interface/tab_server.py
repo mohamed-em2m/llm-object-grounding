@@ -289,6 +289,20 @@ def _build_server_tab(server_status_badge: gr.HTML) -> Dict[str, Any]:
                     ],
                     value="q4_0",
                 )
+                gr.HTML(_section_title("⚡", "Batch Processing Sizes"))
+                with gr.Row():
+                    server_batch_size = gr.Number(
+                        label="Batch Size (-b / --batch-size)",
+                        value=2048,
+                        precision=0,
+                        info="Logical batch size for prompt processing.",
+                    )
+                    server_ubatch_size = gr.Number(
+                        label="Micro-Batch Size (-ub / --ubatch-size)",
+                        value=512,
+                        precision=0,
+                        info="Physical micro-batch size submitted to GPU.",
+                    )
                 gr.HTML(_section_title("🖼️", "Vision / Image Tokens"))
                 with gr.Row():
                     server_img_min_tokens = gr.Number(
@@ -351,6 +365,8 @@ def _build_server_tab(server_status_badge: gr.HTML) -> Dict[str, Any]:
         server_parallel_slots_input=server_parallel_slots_input,
         server_gpu_layers=server_gpu_layers,
         server_kv_cache=server_kv_cache,
+        server_batch_size=server_batch_size,
+        server_ubatch_size=server_ubatch_size,
         server_img_min_tokens=server_img_min_tokens,
         server_img_max_tokens=server_img_max_tokens,
         server_log_disable=server_log_disable,
