@@ -47,6 +47,7 @@ logger = logging.getLogger("detection_pipeline")
 
 class PipelineCancelledException(Exception):
     """Raised when a user cancels the pipeline mid-run."""
+
     pass
 
 
@@ -376,7 +377,7 @@ def run_batch_detection_gui(
                 batch_results[stem] = {
                     "grid_original": draw_grid(
                         base_image,
-                        step=prep_config.get("grid_step", 100),
+                        step=prep_config.get("grid_step", 250),
                         style=prep_config.get("grid_style", "standard"),
                         line_color=prep_config.get("grid_line_color", "red"),
                         line_width=prep_config.get("grid_line_width", 1),
@@ -689,6 +690,7 @@ def cancel_pipeline():
 # Explorer Callbacks
 # ---------------------------------------------------------------------------
 
+
 def on_explorer_image_change(selected_image, batch_id):
     batch_results = _cache_get(batch_id)
     if not batch_results or not selected_image or selected_image not in batch_results:
@@ -787,6 +789,7 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
 # UI Toggle Helpers
 # ---------------------------------------------------------------------------
 
+
 def toggle_run_btn(is_running):
     return gr.update(interactive=not is_running), gr.update(interactive=is_running)
 
@@ -807,6 +810,7 @@ def toggle_external_api(use_external):
 # ---------------------------------------------------------------------------
 # UI Sub-Builder
 # ---------------------------------------------------------------------------
+
 
 def _build_batch_tab():
     """Build the Batch Sandbox tab and return all interactive components."""
