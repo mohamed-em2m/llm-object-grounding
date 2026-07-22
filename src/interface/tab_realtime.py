@@ -97,6 +97,13 @@ class SessionDetector:
         default_factory=lambda: itertools.count(1)
     )
 
+    # Motion-gating state: the small grayscale frame that was last SENT to
+    # detection, and when that happened. New frames are diffed against this
+    # to decide whether the scene has actually changed enough to bother
+    # calling the model again -- replaces the old "just poll every N sec".
+    reference_gray: Optional[np.ndarray] = None
+    last_detect_time: float = 0.0
+
     def next_frame_id(self) -> int:
         return next(self._frame_counter)
 
@@ -107,26 +114,6 @@ class SessionDetector:
     def submit(self, frame_id, fn, *args) -> None:
         with self.lock:
             self.future = self.executor.submit(self._run_and_store, frame_id, fn, *args)
-
-    def wait_for_current(self, timeout: Optional[float] = None) -> None:
-        """
-        Block until whatever detection is currently in flight actually
-        finishes (success or error) -- instead of polling on a fixed timer
-        and moving on regardless. `_run_and_store` already swallows
-        exceptions and writes an ERROR hud, so this never raises for a
-        model failure; it only raises TimeoutError if `timeout` is hit,
-        which we treat as "still thinking" and let the caller continue.
-        """
-        with self.lock:
-            fut = self.future
-        if fut is not None and not fut.done():
-            try:
-                fut.result(timeout=timeout)
-            except Exception:
-                # Either a real TimeoutError (model still running -- fine,
-                # caller will just show the previous boxes this tick) or an
-                # exception already captured into last_hud by _run_and_store.
-                pass
 
     def _run_and_store(self, frame_id, fn, *args):
         try:
@@ -160,6 +147,44 @@ def new_session_detector() -> SessionDetector:
 # ---------------------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------------------
+def _to_small_gray(frame_rgb: np.ndarray, size=(160, 120)) -> Optional[np.ndarray]:
+    """Downscaled, blurred grayscale version of a frame, cheap to diff."""
+    if cv2 is None:
+        return None
+    small = cv2.resize(frame_rgb, size, interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    return gray
+
+
+def _scene_has_changed(
+    current_gray: np.ndarray,
+    reference_gray: Optional[np.ndarray],
+    pixel_diff_thresh: int = 25,
+    change_ratio_thresh: float = 0.015,
+) -> bool:
+    """
+    absdiff + threshold motion detection: compares `current_gray` against
+    the last frame that was actually sent to the model. Returns True if
+    enough pixels changed to be worth re-running detection.
+
+    - No reference yet (first frame) -> always True.
+    - `pixel_diff_thresh`: how much a pixel's brightness must change (0-255)
+      to count as "different" -- filters out sensor noise.
+    - `change_ratio_thresh`: fraction of pixels that must be "different"
+      for the frame as a whole to count as changed (e.g. 0.015 = 1.5%).
+    """
+    if reference_gray is None:
+        return True
+    if cv2 is None:
+        return True  # can't diff without cv2 -- fail open, always detect
+    diff = cv2.absdiff(current_gray, reference_gray)
+    _, thresholded = cv2.threshold(diff, pixel_diff_thresh, 255, cv2.THRESH_BINARY)
+    changed_pixels = cv2.countNonZero(thresholded)
+    total_pixels = thresholded.shape[0] * thresholded.shape[1]
+    return (changed_pixels / total_pixels) > change_ratio_thresh
+
+
 def draw_boxes_opencv(image_np: np.ndarray, boxes: List[Any]) -> np.ndarray:
     """Fast OpenCV bounding box rendering (<1ms vs ~200ms for Matplotlib)."""
     if cv2 is None or not boxes:
@@ -267,27 +292,28 @@ def process_single_frame(
     ext_model_name: str,
     confidence_thresh: float,
     max_resolution: int,
+    motion_sensitivity_pct: float,
+    stale_refresh_seconds: float,
     session: SessionDetector,
-    max_wait_seconds: float = 8.0,
 ) -> tuple[Optional[np.ndarray], str, SessionDetector]:
     """
     Called on every Gradio webcam stream tick.
 
-    Unlike a fire-and-forget design (where each tick just redraws whatever
-    boxes happen to already be cached), this now WAITS for a still-running
-    detection to finish before doing anything else. That means:
-      - stream_every=0.3 is only a *minimum* poll interval, not a hard
-        deadline the model has to hit -- a tick that arrives while the model
-        is still working blocks (up to `max_wait_seconds`) until it's done,
-        instead of ignoring that in-flight work and just re-showing stale
-        boxes on a fresh timer.
-      - detection calls are therefore strictly serialized and paced by real
-        model latency: the *next* detection is only submitted once the
-        *current* one has actually completed.
-      - if the model is slower than `max_wait_seconds`, we give up waiting
-        for THIS tick (so the UI doesn't hang indefinitely) and just show
-        the last completed boxes; the in-flight future is left running and
-        will be picked up (via is_busy()) on a later tick.
+    - EVERY tick immediately returns the current live frame with whatever
+      boxes are already cached, drawn on top -- the video output is never
+      delayed waiting on the model. This is what keeps the stream smooth.
+    - In the background, at most one detection runs at a time. Instead of
+      deciding "should I detect?" from a fixed timer, we diff the current
+      frame against the last frame we actually sent to the model
+      (absdiff + threshold on a small grayscale copy). If the scene hasn't
+      meaningfully changed, we skip the model call entirely and just keep
+      reusing the boxes we already have -- they stay on screen until a real
+      change triggers a fresh detection that replaces them.
+    - `stale_refresh_seconds` is a small safety net: even with zero motion,
+      we still re-check every so often (default a few seconds) so a missed
+      detection (e.g. object present before the stream even started) isn't
+      stuck forever. Set it high (or math.inf) to disable and rely on
+      motion alone.
     """
     if session is None:
         session = new_session_detector()
@@ -298,41 +324,54 @@ def process_single_frame(
 
     pil_img = Image.fromarray(frame).convert("RGB")
 
-    # If a detection is still running from a previous tick, wait for it
-    # (bounded) instead of immediately drawing stale boxes on a reset timer.
-    if session.is_busy():
-        session.wait_for_current(timeout=max_wait_seconds)
-
-    max_res = int(max_resolution or 640)
-    categories = [c.strip() for c in categories_str.split(",") if c.strip()] or [
-        "object"
-    ]
-    base_url, api_key, model_name = _resolve_endpoint(
-        server_port, use_external_api, ext_api_url, ext_api_key, ext_model_name
-    )
-
-    # Only submit a new detection once we know the previous one is settled
-    # (is_busy() re-checked after the wait above -- it may still be running
-    # if we hit max_wait_seconds, in which case we skip submitting again
-    # rather than piling up a second concurrent detection).
-    if not session.is_busy():
-        proc_img, prep_info = preprocess_resolution(
-            pil_img, enabled=True, target_short_edge=max_res
-        )
-        frame_id = session.next_frame_id()
-        session.submit(
-            frame_id,
-            _detect,
-            np.array(proc_img),
-            categories,
-            base_url,
-            api_key,
-            model_name,
-            prep_info,
-        )
-
+    # 1) Always draw the CURRENT live frame with the latest cached boxes,
+    #    right away -- this never waits on detection.
     boxes_to_draw, hud = session.snapshot()
     annotated_live = draw_boxes_opencv(np.array(pil_img), boxes_to_draw)
+
+    # 2) Decide, in the background, whether this frame is worth detecting.
+    if not session.is_busy():
+        gray_small = _to_small_gray(frame)
+        change_ratio_thresh = max(0.0, float(motion_sensitivity_pct or 1.5)) / 100.0
+        now = time.time()
+        stale = (now - session.last_detect_time) >= max(
+            0.5, float(stale_refresh_seconds or 6.0)
+        )
+        changed = (
+            _scene_has_changed(
+                gray_small,
+                session.reference_gray,
+                change_ratio_thresh=change_ratio_thresh,
+            )
+            if gray_small is not None
+            else True
+        )
+
+        if changed or stale:
+            max_res = int(max_resolution or 640)
+            categories = [
+                c.strip() for c in categories_str.split(",") if c.strip()
+            ] or ["object"]
+            base_url, api_key, model_name = _resolve_endpoint(
+                server_port, use_external_api, ext_api_url, ext_api_key, ext_model_name
+            )
+            proc_img, prep_info = preprocess_resolution(
+                pil_img, enabled=True, target_short_edge=max_res
+            )
+            frame_id = session.next_frame_id()
+            session.submit(
+                frame_id,
+                _detect,
+                np.array(proc_img),
+                categories,
+                base_url,
+                api_key,
+                model_name,
+                prep_info,
+            )
+            session.reference_gray = gray_small
+            session.last_detect_time = now
+
     return annotated_live, hud, session
 
 
@@ -459,6 +498,23 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     label="MAX FRAME RESOLUTION (PX)",
                     info="Lower resolution = faster real-time processing and lower latency.",
                 )
+                c["motion_sensitivity"] = gr.Slider(
+                    minimum=0.5,
+                    maximum=10.0,
+                    step=0.5,
+                    value=1.5,
+                    label="MOTION SENSITIVITY (% PIXELS CHANGED)",
+                    info="Webcam mode: a new detection only runs once at least this % of the "
+                    "frame changes (absdiff+threshold). Lower = more sensitive/more model calls.",
+                )
+                c["stale_refresh"] = gr.Slider(
+                    minimum=2.0,
+                    maximum=20.0,
+                    step=1.0,
+                    value=6.0,
+                    label="STALE REFRESH FALLBACK (SECONDS)",
+                    info="Webcam mode: re-detect anyway after this long, even with no motion.",
+                )
                 c["sample_interval"] = gr.Slider(
                     minimum=0.5,
                     maximum=5.0,
@@ -535,6 +591,8 @@ def _wire_realtime_events(
             c_bat["ext_model_name"],
             gr.State(0.3),
             c_real["max_resolution"],
+            c_real["motion_sensitivity"],
+            c_real["stale_refresh"],
             c_real["session_state"],
         ],
         outputs=[
@@ -543,12 +601,6 @@ def _wire_realtime_events(
             c_real["session_state"],
         ],
         stream_every=0.3,
-        # process_single_frame can now block (waiting on the model), so we
-        # cap this event to one execution at a time per session. Without
-        # this, Gradio's queue would keep dispatching new ticks every 0.3s
-        # regardless of whether the previous tick is still waiting, which
-        # is exactly the "timer keeps resetting, never waits" behavior.
-        concurrency_limit=1,
     )
 
     c_real["process_video_btn"].click(
