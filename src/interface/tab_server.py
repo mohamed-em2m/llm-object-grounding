@@ -271,7 +271,7 @@ def _build_server_tab(server_status_badge: gr.HTML) -> Dict[str, Any]:
                     precision=0,
                 )
                 server_parallel_slots_input = gr.Number(
-                    label="Parallel Slots", value=2, precision=0
+                    label="Parallel Slots", value=1, precision=0
                 )
                 server_gpu_layers = gr.Number(
                     label="GPU Layers (-ngl)", value=-1, precision=0
