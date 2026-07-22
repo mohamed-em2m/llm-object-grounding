@@ -6,7 +6,7 @@ import time
 import logging
 from typing import Dict, Any
 import gradio as gr
-import GPUtil
+
 from servers import LlamaServerManager
 from interface.state import (
     state,
@@ -16,6 +16,7 @@ from interface.state import (
     _section_title,
     handle_preset_change,
 )
+import subprocess
 
 logger = logging.getLogger("detection_pipeline")
 
@@ -62,7 +63,13 @@ def start_server_wrapper(
             '<span class="status-badge badge-starting">INITIALIZING...</span>',
         )
 
-        num_gpus = len(GPUtil.getGPUs())
+        num_gpus = int(
+            subprocess.check_output(
+                "nvidia-smi -L | wc -l",
+                shell=True,
+                text=True,
+            ).strip()
+        )
         tensor_split = "1," * num_gpus
         spec_type = "draft-mtp" if enable_mtp else "none"
         state.server_manager = LlamaServerManager(

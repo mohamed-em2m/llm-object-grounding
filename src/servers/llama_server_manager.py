@@ -4,9 +4,14 @@ import threading
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import GPUtil
 
-num_gpus = len(GPUtil.getGPUs())
+num_gpus = int(
+    subprocess.check_output(
+        "nvidia-smi -L | wc -l",
+        shell=True,
+        text=True,
+    ).strip()
+)
 tensor_split = "1," * num_gpus
 
 
