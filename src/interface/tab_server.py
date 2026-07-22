@@ -8,6 +8,7 @@ from typing import Dict, Any
 import gradio as gr
 
 from servers import LlamaServerManager
+from servers.llama_server_manager import num_gpus as _num_gpus
 from interface.state import (
     state,
     LOG_TAIL_BYTES,
@@ -16,9 +17,9 @@ from interface.state import (
     _section_title,
     handle_preset_change,
 )
-import subprocess
 
 logger = logging.getLogger("detection_pipeline")
+
 
 
 def start_server_wrapper(
@@ -63,14 +64,7 @@ def start_server_wrapper(
             '<span class="status-badge badge-starting">INITIALIZING...</span>',
         )
 
-        num_gpus = int(
-            subprocess.check_output(
-                "nvidia-smi -L | wc -l",
-                shell=True,
-                text=True,
-            ).strip()
-        )
-        tensor_split = "1," * num_gpus
+        tensor_split = ",".join(["1"] * _num_gpus)
         spec_type = "draft-mtp" if enable_mtp else "none"
         state.server_manager = LlamaServerManager(
             model=model,

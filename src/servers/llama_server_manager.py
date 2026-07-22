@@ -5,14 +5,22 @@ import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-num_gpus = int(
-    subprocess.check_output(
-        "nvidia-smi -L | wc -l",
-        shell=True,
-        text=True,
-    ).strip()
-)
-tensor_split = "1," * num_gpus
+def _detect_gpu_count() -> int:
+    """Return the number of NVIDIA GPUs detected; falls back to 1 on any error."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "-L"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        count = sum(1 for line in out.splitlines() if line.strip())
+        return max(count, 1)
+    except Exception:
+        return 1
+
+
+num_gpus = _detect_gpu_count()
+tensor_split = ",".join(["1"] * num_gpus)
 
 
 # ─── Llama Server Class ───────────────────────────────────────────────────────

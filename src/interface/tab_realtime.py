@@ -24,13 +24,20 @@ from free_detection.detection_pipeline import (
     parse_detections,
     validate_detections,
 )
+from free_detection.image_preprocessing import (
+    preprocess_resolution,
+    map_bbox_to_original,
+)
 
 # ---------------------------------------------------------------------------
 # Global Lock & Cache for Real-Time Non-Blocking Frame Dropping
 # ---------------------------------------------------------------------------
 _realtime_lock = threading.Lock()
-_last_annotated_frame: Optional[np.ndarray] = None
+_detect_thread: Optional[threading.Thread] = None
+_last_raw_frame: Optional[np.ndarray] = None        # Latest webcam frame captured
+_last_annotated_frame: Optional[np.ndarray] = None  # Latest detection result to display
 _last_hud_info: str = '<div class="neo-retro-hud-stat">STATUS: INITIALIZED</div>'
+_tick_counter: int = 0                              # Monotonic counter forces Gradio diff
 
 
 def draw_boxes_opencv(image_np: np.ndarray, boxes: List[Any]) -> np.ndarray:
@@ -73,6 +80,71 @@ def draw_boxes_opencv(image_np: np.ndarray, boxes: List[Any]) -> np.ndarray:
     return img
 
 
+def _run_detection_bg(
+    frame: np.ndarray,
+    categories: list,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    prep_info: dict,
+    orig_frame: np.ndarray,
+):
+    """Background thread: runs VLM detection and updates global cache."""
+    global _last_annotated_frame, _last_hud_info
+
+    start_time = time.time()
+    try:
+        pil_img = Image.fromarray(frame).convert("RGB")
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        pipeline = ObjectDetectionPipeline(client=client, detector_model=model_name)
+
+        img_uri = pil_to_data_uri(pil_img)
+        raw_output = pipeline.run_inference(
+            image_uris=img_uri,
+            categories=categories,
+            category_definitions="",
+        )
+        parsed_dets = parse_detections(raw_output)
+        valid_dets = validate_detections(parsed_dets, categories)
+
+        orig_w = prep_info["orig_w"]
+        orig_h = prep_info["orig_h"]
+
+        boxes = []
+        for d in valid_dets:
+            bbox = d.get("bbox_2d", [])
+            lbl = d.get("label", "")
+            if len(bbox) == 4:
+                # Use map_bbox_to_original to remap from preprocessed-image
+                # coordinate space (0-1000) back to original frame pixel space,
+                # correctly accounting for any scaling/padding done by preprocess_resolution.
+                x1, y1, x2, y2 = map_bbox_to_original(list(bbox), prep_info)
+                ymin = y1 * orig_h / 1000.0
+                xmin = x1 * orig_w / 1000.0
+                ymax = y2 * orig_h / 1000.0
+                xmax = x2 * orig_w / 1000.0
+                boxes.append([ymin, xmin, ymax, xmax, lbl])
+
+        # Draw on the ORIGINAL resolution frame (not the downscaled one)
+        annotated_np = draw_boxes_opencv(orig_frame.copy(), boxes)
+
+        elapsed = (time.time() - start_time) * 1000.0
+        fps = 1000.0 / max(elapsed, 1.0)
+
+        with _realtime_lock:
+            _last_annotated_frame = annotated_np
+            _last_hud_info = (
+                f'<div class="neo-retro-hud-stat">FPS: {fps:.1f} | '
+                f"LATENCY: {elapsed:.0f}ms | DETECTED: {len(boxes)}</div>"
+            )
+    except Exception as e:
+        with _realtime_lock:
+            _last_hud_info = (
+                f'<div class="neo-retro-hud-stat" style="color:#ff0055 !important;">'
+                f"ERROR: {html.escape(str(e))}</div>"
+            )
+
+
 def process_single_frame(
     frame: np.ndarray,
     categories_str: str,
@@ -84,85 +156,73 @@ def process_single_frame(
     confidence_thresh: float,
     max_resolution: int = 640,
 ) -> tuple[Optional[np.ndarray], str]:
-    global _last_annotated_frame, _last_hud_info
+    """
+    Called on every Gradio stream tick (~0.3 s).
+
+    Strategy:
+    - Each tick we start a NEW background detection thread only if no thread
+      is currently running (non-blocking; incoming frames are dropped while
+      the model is busy).
+    - We ALWAYS return a *fresh copy* of the current best annotated frame so
+      that Gradio detects a value change every tick and pushes the update to
+      the browser immediately when the previous detection finishes.
+    """
+    global _detect_thread, _last_raw_frame, _tick_counter
 
     if frame is None:
-        return _last_annotated_frame, '<div class="neo-retro-hud-stat">STATUS: READY</div>'
+        with _realtime_lock:
+            out = _last_annotated_frame.copy() if _last_annotated_frame is not None else None
+            hud = _last_hud_info
+        return out, hud
 
-    # Non-blocking lock: if model is busy processing previous frame, drop this incoming stream frame
-    acquired = _realtime_lock.acquire(blocking=False)
-    if not acquired:
-        return _last_annotated_frame, _last_hud_info
+    # Downscale the frame sent to the model using preprocess_resolution from
+    # image_preprocessing.py. This preserves aspect ratio via LANCZOS resampling
+    # and returns a prep_info dict for correct coordinate remapping.
+    pil_img = Image.fromarray(frame).convert("RGB")
+    max_res = int(max_resolution or 640)
+    proc_img, prep_info = preprocess_resolution(
+        pil_img,
+        enabled=True,
+        target_short_edge=max_res,
+    )
 
-    start_time = time.time()
-    try:
-        pil_img = Image.fromarray(frame).convert("RGB")
+    categories = [c.strip() for c in categories_str.split(",") if c.strip()] or ["object"]
+    base_url = ext_api_url if use_external_api else f"http://127.0.0.1:{server_port}/v1"
+    api_key = ext_api_key if use_external_api else "no-key"
+    model_name = ext_model_name if use_external_api else "local-model"
 
-        # Downscale for real-time VLM inference speed if frame exceeds max_resolution
-        orig_w, orig_h = pil_img.size
-        max_res = int(max_resolution or 640)
-        if max(orig_w, orig_h) > max_res:
-            scale = max_res / float(max(orig_w, orig_h))
-            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-            proc_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+    orig_frame_np = np.array(pil_img)  # original resolution numpy array for display
+
+    # Launch detection in background only if previous thread has finished
+    if _detect_thread is None or not _detect_thread.is_alive():
+        t = threading.Thread(
+            target=_run_detection_bg,
+            args=(
+                np.array(proc_img),   # downscaled for model speed
+                categories,
+                base_url,
+                api_key,
+                model_name,
+                prep_info,            # carries orig_w, orig_h, scale, pad offsets
+                orig_frame_np,        # display frame at original resolution
+            ),
+            daemon=True,
+        )
+        t.start()
+        _detect_thread = t
+
+    # Always return a *copy* so Gradio sees a different object every tick.
+    # This is the key fix: returning the same ndarray reference causes
+    # Gradio to skip the browser push (it sees no diff).
+    with _realtime_lock:
+        if _last_annotated_frame is not None:
+            out_frame = _last_annotated_frame.copy()
         else:
-            proc_img = pil_img
-            new_w, new_h = orig_w, orig_h
+            # Before first detection completes, show the raw webcam frame
+            out_frame = frame.copy()
+        hud = _last_hud_info
 
-        categories = [c.strip() for c in categories_str.split(",") if c.strip()]
-        if not categories:
-            categories = ["object"]
-
-        base_url = (
-            ext_api_url if use_external_api else f"http://127.0.0.1:{server_port}/v1"
-        )
-        api_key = ext_api_key if use_external_api else "no-key"
-        model_name = ext_model_name if use_external_api else "local-model"
-
-        client = OpenAI(base_url=base_url, api_key=api_key)
-        pipeline = ObjectDetectionPipeline(client=client, detector_model=model_name)
-
-        img_uri = pil_to_data_uri(proc_img)
-        raw_output = pipeline.run_inference(
-            image_uris=img_uri,
-            categories=categories,
-            category_definitions="",
-        )
-        parsed_dets = parse_detections(raw_output)
-        valid_dets = validate_detections(parsed_dets, categories)
-
-        boxes = []
-        for d in valid_dets:
-            bbox = d.get("bbox_2d", [])
-            lbl = d.get("label", "")
-            if len(bbox) == 4:
-                # Convert 0-1000 normalized coordinates to original frame pixel space
-                x1, y1, x2, y2 = bbox
-                ymin = y1 * orig_h / 1000.0
-                xmin = x1 * orig_w / 1000.0
-                ymax = y2 * orig_h / 1000.0
-                xmax = x2 * orig_w / 1000.0
-                boxes.append([ymin, xmin, ymax, xmax, lbl])
-
-        annotated_np = draw_boxes_opencv(np.array(pil_img), boxes)
-
-        elapsed = (time.time() - start_time) * 1000.0
-        fps = 1000.0 / max(elapsed, 1.0)
-        hud_info = (
-            f'<div class="neo-retro-hud-stat">FPS: {fps:.1f} | '
-            f"LATENCY: {elapsed:.0f}ms | DETECTED: {len(boxes)}</div>"
-        )
-
-        _last_annotated_frame = annotated_np
-        _last_hud_info = hud_info
-
-        return annotated_np, hud_info
-
-    except Exception as e:
-        err_hud = f'<div class="neo-retro-hud-stat" style="color:#ff0055 !important;">ERROR: {html.escape(str(e))}</div>'
-        return frame, err_hud
-    finally:
-        _realtime_lock.release()
+    return out_frame, hud
 
 
 def process_video_frames(
