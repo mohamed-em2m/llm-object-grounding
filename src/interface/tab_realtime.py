@@ -108,6 +108,26 @@ class SessionDetector:
         with self.lock:
             self.future = self.executor.submit(self._run_and_store, frame_id, fn, *args)
 
+    def wait_for_current(self, timeout: Optional[float] = None) -> None:
+        """
+        Block until whatever detection is currently in flight actually
+        finishes (success or error) -- instead of polling on a fixed timer
+        and moving on regardless. `_run_and_store` already swallows
+        exceptions and writes an ERROR hud, so this never raises for a
+        model failure; it only raises TimeoutError if `timeout` is hit,
+        which we treat as "still thinking" and let the caller continue.
+        """
+        with self.lock:
+            fut = self.future
+        if fut is not None and not fut.done():
+            try:
+                fut.result(timeout=timeout)
+            except Exception:
+                # Either a real TimeoutError (model still running -- fine,
+                # caller will just show the previous boxes this tick) or an
+                # exception already captured into last_hud by _run_and_store.
+                pass
+
     def _run_and_store(self, frame_id, fn, *args):
         try:
             boxes, hud = fn(*args)
@@ -248,15 +268,26 @@ def process_single_frame(
     confidence_thresh: float,
     max_resolution: int,
     session: SessionDetector,
+    max_wait_seconds: float = 8.0,
 ) -> tuple[Optional[np.ndarray], str, SessionDetector]:
     """
     Called on every Gradio webcam stream tick.
-    - Every tick receives the LIVE webcam frame from the browser.
-    - If no background detection is running *for this session*, launch one
-      asynchronously on a downscaled frame.
-    - Render the latest known boxes for this session onto the CURRENT LIVE frame.
-    - The stream stays smooth while boxes update asynchronously, and results
-      from different sessions can never mix.
+
+    Unlike a fire-and-forget design (where each tick just redraws whatever
+    boxes happen to already be cached), this now WAITS for a still-running
+    detection to finish before doing anything else. That means:
+      - stream_every=0.3 is only a *minimum* poll interval, not a hard
+        deadline the model has to hit -- a tick that arrives while the model
+        is still working blocks (up to `max_wait_seconds`) until it's done,
+        instead of ignoring that in-flight work and just re-showing stale
+        boxes on a fresh timer.
+      - detection calls are therefore strictly serialized and paced by real
+        model latency: the *next* detection is only submitted once the
+        *current* one has actually completed.
+      - if the model is slower than `max_wait_seconds`, we give up waiting
+        for THIS tick (so the UI doesn't hang indefinitely) and just show
+        the last completed boxes; the in-flight future is left running and
+        will be picked up (via is_busy()) on a later tick.
     """
     if session is None:
         session = new_session_detector()
@@ -266,11 +297,13 @@ def process_single_frame(
         return None, hud, session
 
     pil_img = Image.fromarray(frame).convert("RGB")
-    max_res = int(max_resolution or 640)
-    proc_img, prep_info = preprocess_resolution(
-        pil_img, enabled=True, target_short_edge=max_res
-    )
 
+    # If a detection is still running from a previous tick, wait for it
+    # (bounded) instead of immediately drawing stale boxes on a reset timer.
+    if session.is_busy():
+        session.wait_for_current(timeout=max_wait_seconds)
+
+    max_res = int(max_resolution or 640)
     categories = [c.strip() for c in categories_str.split(",") if c.strip()] or [
         "object"
     ]
@@ -278,13 +311,19 @@ def process_single_frame(
         server_port, use_external_api, ext_api_url, ext_api_key, ext_model_name
     )
 
+    # Only submit a new detection once we know the previous one is settled
+    # (is_busy() re-checked after the wait above -- it may still be running
+    # if we hit max_wait_seconds, in which case we skip submitting again
+    # rather than piling up a second concurrent detection).
     if not session.is_busy():
+        proc_img, prep_info = preprocess_resolution(
+            pil_img, enabled=True, target_short_edge=max_res
+        )
         frame_id = session.next_frame_id()
-        proc_np = np.array(proc_img)
         session.submit(
             frame_id,
             _detect,
-            proc_np,
+            np.array(proc_img),
             categories,
             base_url,
             api_key,
@@ -504,6 +543,12 @@ def _wire_realtime_events(
             c_real["session_state"],
         ],
         stream_every=0.3,
+        # process_single_frame can now block (waiting on the model), so we
+        # cap this event to one execution at a time per session. Without
+        # this, Gradio's queue would keep dispatching new ticks every 0.3s
+        # regardless of whether the previous tick is still waiting, which
+        # is exactly the "timer keeps resetting, never waits" behavior.
+        concurrency_limit=1,
     )
 
     c_real["process_video_btn"].click(
