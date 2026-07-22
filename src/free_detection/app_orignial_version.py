@@ -1,16 +1,24 @@
 """
-Batch Sandbox tab UI and execution engine functions.
+LLM Object Detection Console.
+
+Styled with the dark "terminal" Gradio console look (console_theme.py +
+console.css + console.js) — see references/patterns.md in the
+gradio-api-console skill for the rationale behind each pattern reused here.
 """
 
-import io
+import sys
+import os
 import time
 import json
-import html
 import queue
 import shutil
-import logging
-import traceback
+import zipfile
 import threading
+import io
+import logging
+import html
+import traceback
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,33 +28,313 @@ import httpx
 from PIL import Image
 from openai import OpenAI
 
-from free_detection.detection_pipeline import (
+from interface.console_theme import theme
+
+src_dir = Path(__file__).parent
+if str(src_dir) not in sys.path:
+    sys.path.append(str(src_dir))
+
+from detection_pipeline import (
     ObjectDetectionPipeline,
     RoundResult,
     draw_grid,
     DEFAULT_DETECTOR_TEMPLATE,
     DEFAULT_JUDGE_TEMPLATE,
 )
-from interface.state import (
-    state,
-    _STATUS_PILL,
-    DEFAULT_CONCURRENCY,
-    LOG_TAIL_BYTES,
-    _cache_put,
-    _cache_get,
-    zip_results_folder,
-    panel_header,
-    _render_progress_bar,
-    _section_title,
-    _tail,
-    toggle_custom_color_field,
-)
+from llama_server_manager import LlamaServerManager
 
-logger = logging.getLogger("detection_pipeline")
+_iface_dir = os.path.join(os.path.dirname(__file__), "interface")
+
+with open(os.path.join(_iface_dir, "console.css"), encoding="utf-8") as f:
+    custom_css = f.read()
+with open(os.path.join(_iface_dir, "console.js"), encoding="utf-8") as f:
+    CONSOLE_JS = f.read()
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONCURRENCY = 16
+
+MODEL_PRESETS = [
+    "unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
+    "unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q2_K_XL",
+    "unsloth/gemma-4-31B-it-qat-GGUF:UD-Q4_K_XL",
+    "unsloth/gemma-4-31B-it-GGUF:UD-IQ2_M",
+    "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q3_K_M",
+    "custom",
+]
+
+_STATUS_PILL = {
+    "queued": '<span class="img-status-pill pill-queued">QUEUED</span>',
+    "running": '<span class="img-status-pill pill-running">RUNNING</span>',
+    "done": '<span class="img-status-pill pill-done">DONE</span>',
+    "error": '<span class="img-status-pill pill-error">ERROR</span>',
+    "cancelled": '<span class="img-status-pill pill-cancelled">CANCELLED</span>',
+}
+
+LOG_TAIL_BYTES = 8 * 1024
+MAX_CACHED_BATCHES = 3
+
+# ---------------------------------------------------------------------------
+# Global State & Caching
+# ---------------------------------------------------------------------------
+
+server_manager: Optional[LlamaServerManager] = None
+server_lock = threading.Lock()
+pipeline_cancel_event = threading.Event()
+
+BATCH_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+BATCH_CACHE_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _cache_put(batch_id: str, value: Dict[str, Any]) -> None:
+    with BATCH_CACHE_LOCK:
+        BATCH_CACHE[batch_id] = value
+        BATCH_CACHE.move_to_end(batch_id)
+        while len(BATCH_CACHE) > MAX_CACHED_BATCHES:
+            BATCH_CACHE.popitem(last=False)
+
+
+def _cache_get(batch_id: str) -> Dict[str, Any]:
+    with BATCH_CACHE_LOCK:
+        b = BATCH_CACHE.get(batch_id)
+        if b is not None:
+            BATCH_CACHE.move_to_end(batch_id)
+        return b or {}
+
+
+def _cache_drop(batch_id: str) -> None:
+    with BATCH_CACHE_LOCK:
+        BATCH_CACHE.pop(batch_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def zip_results_folder(folder_path: Path) -> Path:
+    zip_path = folder_path.parent / f"batch_results_{int(time.time())}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for file in folder_path.rglob("*"):
+            if file.is_file() and file.name != zip_path.name:
+                zipf.write(file, file.relative_to(folder_path))
+    return zip_path
+
+
+def handle_preset_change(preset: str) -> gr.update:
+    if preset == "custom":
+        return gr.update(value="", visible=True)
+    return gr.update(value=preset, visible=True)
+
+
+def panel_header(title: str, raw_ta_id: str) -> str:
+    return f"""
+<div class="out-header">
+  <div class="out-header-left">
+    <span class="out-header-dot"></span>
+    <span class="out-header-title">{title}</span>
+  </div>
+  <div class="out-header-right">
+    <button class="copy-btn" onclick="copyOut('{raw_ta_id}')">&#9096; Copy Raw Text</button>
+  </div>
+</div>"""
+
+
+def _tail(s: str, n: int = LOG_TAIL_BYTES) -> str:
+    if len(s) <= n:
+        return s
+    return "...[log tail truncated]...\n" + s[-n:]
+
+
+def _render_progress_bar(pct: int, status: str = "") -> str:
+    pct = max(0, min(100, int(pct)))
+    return f"""
+    <div class="custom-progress-wrapper">
+        <div class="custom-progress-track">
+            <div class="custom-progress-fill" style="width:{pct}%;"></div>
+        </div>
+        <div class="custom-progress-text">{html.escape(status)} ({pct}%)</div>
+    </div>
+    """
+
+
+def _section_title(icon: str, label: str) -> str:
+    """Render a styled section-title divider inside an accordion."""
+    return f'<div class="config-section-title">{icon} {label}</div>'
+
+
+# ---------------------------------------------------------------------------
+# Server Manager Wrappers
+# ---------------------------------------------------------------------------
+
+
+def start_server_wrapper(
+    model,
+    port,
+    host,
+    enable_thinking,
+    enable_mtp,
+    ctx_size,
+    gpu_layers,
+    kv_cache_type,
+    image_min_tokens,
+    image_max_tokens,
+    parallel_slots,
+):
+    ctx_size = ctx_size * parallel_slots
+    global server_manager
+
+    with server_lock:
+        if server_manager is not None and server_manager.is_healthy():
+            yield "Server is already running and healthy.", f'<span class="status-badge badge-running">RUNNING (Port {server_manager.port})</span>'
+            return
+
+        yield "Stopping any existing server instance...", '<span class="status-badge badge-starting">CLEANING UP...</span>'
+        if server_manager is not None:
+            try:
+                server_manager.stop_llama_server()
+            except Exception as e:
+                print(f"Error stopping old server: {e}")
+            server_manager = None
+
+        yield "Configuring server...", '<span class="status-badge badge-starting">INITIALIZING...</span>'
+
+        spec_type = "draft-mtp" if enable_mtp else "none"
+        server_manager = LlamaServerManager(
+            model=model,
+            host=host,
+            port=int(port),
+            ctx_size=int(ctx_size),
+            parallel_slots=parallel_slots,
+            n_threads=-1,
+            gpu_layers=int(gpu_layers),
+            tensor_split="1,1",
+            main_gpu=0,
+            temp=0.4,
+            top_p=0.95,
+            top_k=64,
+            spec_type=spec_type,
+            spec_draft_n_max=4 if enable_mtp else 0,
+            enable_thinking=enable_thinking,
+            batch_size=1024,
+            ubatch_size=512,
+            kv_cache_type=kv_cache_type,
+            image_min_tokens=(
+                int(image_min_tokens) if image_min_tokens is not None else 1024
+            ),
+            image_max_tokens=(
+                int(image_max_tokens) if image_max_tokens is not None else 4096
+            ),
+        )
+
+        yield "Spawning llama-server process...", '<span class="status-badge badge-starting">STARTING...</span>'
+        try:
+            server_manager.start_llama_server()
+        except Exception as e:
+            server_manager = None
+            yield f"Failed to start server process: {e}", '<span class="status-badge badge-error">PROCESS ERROR</span>'
+            return
+
+    start_time = time.time()
+    timeout = 180
+    healthy = False
+
+    while time.time() - start_time < timeout:
+        with server_lock:
+            if server_manager is None:
+                yield "Server initialization aborted.", '<span class="status-badge badge-stopped">STOPPED</span>'
+                return
+            if server_manager.process and server_manager.process.poll() is not None:
+                exit_code = server_manager.process.poll()
+                logs = server_manager.get_logs()
+                server_manager = None
+                yield f"Server process exited with code {exit_code}.\n\n--- Logs ---\n{logs}", '<span class="status-badge badge-error">CRASHED</span>'
+                return
+            if server_manager.is_healthy():
+                healthy = True
+                break
+
+            logs = server_manager.get_logs()
+            elapsed = int(time.time() - start_time)
+            yield f"Waiting for model to load into memory... ({elapsed}s elapsed)\n\n--- Latest Output ---\n{logs[-1200:]}", '<span class="status-badge badge-starting">STARTING...</span>'
+        time.sleep(2)
+
+    if healthy:
+        yield "Server is up. Running warmup request...", '<span class="status-badge badge-starting">WARMING UP...</span>'
+        try:
+            with server_lock:
+                if server_manager:
+                    server_manager.warmup_model()
+            yield "Server started and warmed up. Ready for detection tasks.", f'<span class="status-badge badge-running">RUNNING (Port {port})</span>'
+        except Exception as e:
+            yield f"Server is healthy, but warmup failed: {e}", f'<span class="status-badge badge-running">RUNNING (Port {port})</span>'
+    else:
+        yield "Timed out waiting for the server to report healthy status.", '<span class="status-badge badge-error">TIMEOUT</span>'
+
+
+def stop_server_wrapper():
+    global server_manager
+    with server_lock:
+        if server_manager is None:
+            return (
+                "No server running.",
+                '<span class="status-badge badge-stopped">STOPPED</span>',
+            )
+        try:
+            server_manager.stop_llama_server()
+            server_manager = None
+            return (
+                "Server stopped successfully.",
+                '<span class="status-badge badge-stopped">STOPPED</span>',
+            )
+        except Exception as e:
+            return (
+                f"Error stopping server: {e}",
+                '<span class="status-badge badge-error">STOP ERROR</span>',
+            )
+
+
+def get_server_status_and_logs():
+    global server_manager
+    with server_lock:
+        if server_manager is None:
+            return (
+                "No server instance exists.",
+                '<span class="status-badge badge-stopped">STOPPED</span>',
+            )
+        if server_manager.process and server_manager.process.poll() is not None:
+            exit_code = server_manager.process.poll()
+            return (
+                f"Server process is dead (Exit code: {exit_code}).\n\n--- Logs ---\n{server_manager.get_logs()}",
+                '<span class="status-badge badge-error">CRASHED</span>',
+            )
+        logs = server_manager.get_logs()
+        if server_manager.is_healthy():
+            return (
+                f"Server is healthy and running.\n\n--- Logs ---\n{logs[-2000:]}",
+                f'<span class="status-badge badge-running">RUNNING (Port {server_manager.port})</span>',
+            )
+        return (
+            f"Server is starting or unhealthy.\n\n--- Logs ---\n{logs[-2000:]}",
+            '<span class="status-badge badge-starting">STARTING...</span>',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Runner helpers
+# ---------------------------------------------------------------------------
 
 
 class PipelineCancelledException(Exception):
     """Raised when a user cancels the pipeline mid-run."""
+
     pass
 
 
@@ -90,6 +378,11 @@ def _render_status_table(image_status: Dict[str, dict], order: List[str]) -> str
   </table>
   </div>
 </div>"""
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Runner
+# ---------------------------------------------------------------------------
 
 
 def run_batch_detection_gui(
@@ -140,7 +433,7 @@ def run_batch_detection_gui(
     prep_custom_resize_width,
     prep_custom_resize_height,
 ):
-    state.pipeline_cancel_event.clear()
+    pipeline_cancel_event.clear()
 
     _empty_yield = (
         None,
@@ -209,8 +502,8 @@ def run_batch_detection_gui(
             )
             return
     else:
-        with state.server_lock:
-            if state.server_manager is None or not state.server_manager.is_healthy():
+        with server_lock:
+            if server_manager is None or not server_manager.is_healthy():
                 yield "Error: Local server not running. Start it on the Server tab or enable External API.", _render_progress_bar(
                     0, "Error"
                 ), None, "", gr.update(
@@ -219,8 +512,8 @@ def run_batch_detection_gui(
                     {}, []
                 )
                 return
-            port = state.server_manager.port
-            model_name = state.server_manager.model
+            port = server_manager.port
+            model_name = server_manager.model
         api_url = f"http://localhost:{port}/v1"
         api_key = "not-needed"
 
@@ -358,7 +651,7 @@ def run_batch_detection_gui(
 
     def process_one_image(img_path: Path):
         stem = stem_for_path[img_path]
-        if state.pipeline_cancel_event.is_set():
+        if pipeline_cancel_event.is_set():
             q.put(("image_skipped", stem))
             return
 
@@ -393,7 +686,7 @@ def run_batch_detection_gui(
             def progress_callback(
                 round_result: RoundResult, annotated_image: Image.Image, _stem=stem
             ):
-                if state.pipeline_cancel_event.is_set():
+                if pipeline_cancel_event.is_set():
                     raise PipelineCancelledException("Pipeline cancelled by user.")
                 q.put(("round", _stem, round_result, annotated_image))
 
@@ -441,7 +734,7 @@ def run_batch_detection_gui(
 
     def worker():
         try:
-            if not state.pipeline_cancel_event.is_set():
+            if not pipeline_cancel_event.is_set():
                 with ThreadPoolExecutor(max_workers=concurrency) as pool:
                     futures = [pool.submit(process_one_image, p) for p in image_paths]
                     for fut in as_completed(futures):
@@ -453,7 +746,7 @@ def run_batch_detection_gui(
                                 )
                             q.put(("image_error", "unknown", str(exc)))
 
-            if state.pipeline_cancel_event.is_set():
+            if pipeline_cancel_event.is_set():
                 q.put(("cancelled",))
             else:
                 try:
@@ -670,14 +963,14 @@ def run_batch_detection_gui(
                 )
                 last_yield_time = now
 
-            time.sleep(0.1)
+            time.sleep(0.1)  # Prevent CPU spin
 
     batch_logger.removeHandler(log_handler)
     log_handler.close()
 
 
 def cancel_pipeline():
-    state.pipeline_cancel_event.set()
+    pipeline_cancel_event.set()
     return (
         "Cancellation requested. In-flight images will finish their current round "
         "and write results; queued images will be skipped. "
@@ -688,6 +981,7 @@ def cancel_pipeline():
 # ---------------------------------------------------------------------------
 # Explorer Callbacks
 # ---------------------------------------------------------------------------
+
 
 def on_explorer_image_change(selected_image, batch_id):
     batch_results = _cache_get(batch_id)
@@ -770,7 +1064,7 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
                 json.dumps(r["detections"], indent=2) if r["detections"] else "[]",
             )
     except Exception as e:
-        logger.error(f"Error loading round details: {e}")
+        print(f"Error loading round details: {e}")
 
     return (
         src_img,
@@ -786,6 +1080,7 @@ def on_explorer_round_change(selected_image, selected_round, batch_id, show_grid
 # ---------------------------------------------------------------------------
 # UI Toggle Helpers
 # ---------------------------------------------------------------------------
+
 
 def toggle_run_btn(is_running):
     return gr.update(interactive=not is_running), gr.update(interactive=is_running)
@@ -804,9 +1099,154 @@ def toggle_external_api(use_external):
     )
 
 
+def toggle_custom_color_field(choice):
+    return gr.update(visible=(choice == "custom"))
+
+
 # ---------------------------------------------------------------------------
-# UI Sub-Builder
+# UI Sub-Builders
 # ---------------------------------------------------------------------------
+
+
+def _build_server_tab(server_status_badge):
+    """Build the Llama Server tab and return all interactive components."""
+
+    gr.HTML('<p class="section-label">Model Server Configuration</p>')
+    with gr.Row(equal_height=False):
+        # ── Left: Config ──────────────────────────────────────────────────
+        with gr.Column(scale=2):
+            gr.HTML(
+                '<div class="config-card"><div class="config-card-title">🦙 Model Selection</div>'
+            )
+            server_preset = gr.Dropdown(
+                label="Recommended Model Presets",
+                choices=MODEL_PRESETS,
+                value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
+                interactive=True,
+            )
+            server_model_input = gr.Textbox(
+                label="Model GGUF Path or HF Repo ID",
+                value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
+                placeholder="e.g. C:/models/qwen.gguf or HF ID",
+                interactive=True,
+            )
+            gr.HTML("</div>")
+
+            gr.HTML(
+                '<div class="config-card"><div class="config-card-title">⚙️ Runtime Options</div>'
+            )
+            server_port_input = gr.Number(
+                label="Port Number",
+                value=8080,
+                precision=0,
+                interactive=True,
+            )
+            with gr.Row():
+                server_thinking_chk = gr.Checkbox(
+                    label="Thinking Mode", value=False, interactive=True
+                )
+                server_mtp_chk = gr.Checkbox(
+                    label="MTP Speculative Drafting",
+                    value=True,
+                    interactive=True,
+                )
+            gr.HTML("</div>")
+
+            with gr.Accordion("Advanced Server Parameters", open=False):
+                gr.HTML(_section_title("🖧", "Network"))
+                server_host_input = gr.Textbox(label="Host Binding", value="0.0.0.0")
+                gr.HTML(_section_title("🎛️", "Compute"))
+                server_ctx_input = gr.Number(
+                    label="Context Size per Slot",
+                    value=15000,
+                    precision=0,
+                )
+                server_parallel_slots_input = gr.Number(
+                    label="Parallel Slots", value=2, precision=0
+                )
+                server_gpu_layers = gr.Number(
+                    label="GPU Layers (-ngl)", value=-1, precision=0
+                )
+                server_kv_cache = gr.Dropdown(
+                    label="KV Cache Type",
+                    choices=[
+                        "f32",
+                        "f16",
+                        "bf16",
+                        "q8_0",
+                        "q4_0",
+                        "q4_1",
+                        "iq4_nl",
+                        "q5_0",
+                        "q5_1",
+                    ],
+                    value="q4_0",
+                )
+                gr.HTML(_section_title("🖼️", "Vision / Image Tokens"))
+                with gr.Row():
+                    server_img_min_tokens = gr.Number(
+                        label="Min Image Tokens (--image-min-tokens)",
+                        value=1024,
+                        precision=0,
+                        info="Minimum tokens for image encoding. Lower = faster but lower quality.",
+                    )
+                    server_img_max_tokens = gr.Number(
+                        label="Max Image Tokens (--image-max-tokens)",
+                        value=4096,
+                        precision=0,
+                        info="Maximum tokens for image encoding. Higher = more detail but slower.",
+                    )
+
+            gr.HTML('<div class="btn-group" style="margin-top:0.75rem;">')
+            with gr.Row():
+                start_server_btn = gr.Button("▶  Start Server", variant="primary")
+                stop_server_btn = gr.Button(
+                    "⏹  Stop Server", variant="secondary", size="sm"
+                )
+                refresh_logs_btn = gr.Button(
+                    "🔄 Refresh Logs",
+                    variant="secondary",
+                    size="sm",
+                )
+            gr.HTML("</div>")
+
+        # ── Right: Logs ───────────────────────────────────────────────────
+        with gr.Column(scale=3):
+            gr.HTML('<p class="section-label">Server Output Console</p>')
+            gr.HTML(
+                '<div class="output-panel" id="server-log-panel">'
+                + panel_header("Live Logs", "server-log-ta")
+            )
+            with gr.Group(elem_classes=["out-md-wrap"]):
+                server_logs_viewer = gr.Textbox(
+                    lines=22,
+                    max_lines=32,
+                    interactive=False,
+                    show_label=False,
+                    container=False,
+                    elem_id="server-log-ta",
+                )
+            gr.HTML("</div>")
+
+    return dict(
+        server_preset=server_preset,
+        server_model_input=server_model_input,
+        server_port_input=server_port_input,
+        server_host_input=server_host_input,
+        server_thinking_chk=server_thinking_chk,
+        server_mtp_chk=server_mtp_chk,
+        server_ctx_input=server_ctx_input,
+        server_parallel_slots_input=server_parallel_slots_input,
+        server_gpu_layers=server_gpu_layers,
+        server_kv_cache=server_kv_cache,
+        server_img_min_tokens=server_img_min_tokens,
+        server_img_max_tokens=server_img_max_tokens,
+        start_server_btn=start_server_btn,
+        stop_server_btn=stop_server_btn,
+        refresh_logs_btn=refresh_logs_btn,
+        server_logs_viewer=server_logs_viewer,
+    )
+
 
 def _build_batch_tab():
     """Build the Batch Sandbox tab and return all interactive components."""
@@ -1300,3 +1740,312 @@ def _build_batch_tab():
         detections_json_box=detections_json_box,
         pipeline_logs_viewer=pipeline_logs_viewer,
     )
+
+
+def _build_prompts_tab():
+    """Build the Prompts tab and return all interactive components."""
+
+    gr.HTML('<p class="section-label">Prompt Engineering</p>')
+    gr.Markdown(
+        "Modify the custom instruction templates fed to the **Detector** and **Judge** agents.\n\n"
+        "Available template variables: `{categories}`, `{category_definitions}`, `{feedback}`, `{detections_json}`"
+    )
+    gr.HTML(
+        '<div class="input-hint">'
+        "Template variables: "
+        '<span class="hint-var">{categories}</span> '
+        '<span class="hint-var">{category_definitions}</span> '
+        '<span class="hint-var">{feedback}</span> '
+        '<span class="hint-var">{detections_json}</span>'
+        "</div>"
+    )
+
+    customize_prompts_chk = gr.Checkbox(
+        label="Enable Custom Prompt Templates", value=False
+    )
+
+    with gr.Group(visible=False) as prompts_group:
+        custom_det_prompt = gr.Textbox(
+            label="Detector Prompt Template",
+            lines=14,
+            value=DEFAULT_DETECTOR_TEMPLATE,
+        )
+        custom_jdg_prompt = gr.Textbox(
+            label="Judge Prompt Template",
+            lines=14,
+            value=DEFAULT_JUDGE_TEMPLATE,
+        )
+
+    customize_prompts_chk.change(
+        lambda v: gr.update(visible=v),
+        customize_prompts_chk,
+        prompts_group,
+    )
+
+    return dict(
+        customize_prompts_chk=customize_prompts_chk,
+        custom_det_prompt=custom_det_prompt,
+        custom_jdg_prompt=custom_jdg_prompt,
+    )
+
+
+def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
+    """Wire all event handlers. c_srv / c_bat / c_pmt are the component dicts."""
+
+    # ── Server tab ────────────────────────────────────────────────────────
+    c_srv["server_preset"].change(
+        handle_preset_change,
+        c_srv["server_preset"],
+        c_srv["server_model_input"],
+    )
+
+    c_srv["start_server_btn"].click(
+        start_server_wrapper,
+        inputs=[
+            c_srv["server_model_input"],
+            c_srv["server_port_input"],
+            c_srv["server_host_input"],
+            c_srv["server_thinking_chk"],
+            c_srv["server_mtp_chk"],
+            c_srv["server_ctx_input"],
+            c_srv["server_gpu_layers"],
+            c_srv["server_kv_cache"],
+            c_srv["server_img_min_tokens"],
+            c_srv["server_img_max_tokens"],
+            c_srv["server_parallel_slots_input"],
+        ],
+        outputs=[c_srv["server_logs_viewer"], server_status_badge],
+    )
+    c_srv["stop_server_btn"].click(
+        stop_server_wrapper,
+        outputs=[c_srv["server_logs_viewer"], server_status_badge],
+    )
+    c_srv["refresh_logs_btn"].click(
+        get_server_status_and_logs,
+        outputs=[c_srv["server_logs_viewer"], server_status_badge],
+    )
+
+    # ── Batch tab — preprocessing toggles ────────────────────────────────
+    c_bat["prep_enabled_chk"].change(
+        lambda v: gr.update(visible=v),
+        inputs=[c_bat["prep_enabled_chk"]],
+        outputs=[c_bat["prep_options_group"]],
+    )
+
+    c_bat["prep_custom_resize_chk"].change(
+        lambda v: gr.update(visible=v),
+        inputs=[c_bat["prep_custom_resize_chk"]],
+        outputs=[c_bat["prep_custom_resize_row"]],
+    )
+
+    for dd, custom_field in [
+        (c_bat["prep_grid_line_color_dropdown"], c_bat["prep_grid_line_color_custom"]),
+        (c_bat["prep_grid_text_color_dropdown"], c_bat["prep_grid_text_color_custom"]),
+        (
+            c_bat["prep_grid_backing_color_dropdown"],
+            c_bat["prep_grid_backing_color_custom"],
+        ),
+    ]:
+        dd.change(toggle_custom_color_field, inputs=[dd], outputs=[custom_field])
+
+    c_bat["prep_send_pixel_bounds_chk"].change(
+        lambda v: gr.update(visible=v),
+        inputs=[c_bat["prep_send_pixel_bounds_chk"]],
+        outputs=[c_bat["prep_pixel_bounds_row"]],
+    )
+
+    # ── External API toggle ───────────────────────────────────────────────
+    c_bat["use_external_api_chk"].change(
+        toggle_external_api,
+        inputs=[c_bat["use_external_api_chk"]],
+        outputs=[
+            c_srv["start_server_btn"],
+            c_srv["stop_server_btn"],
+            c_srv["server_preset"],
+            c_srv["server_model_input"],
+            c_srv["server_port_input"],
+            c_srv["server_thinking_chk"],
+            c_srv["server_mtp_chk"],
+            c_bat["ext_api_group"],
+        ],
+    )
+
+    # ── Run / Cancel ──────────────────────────────────────────────────────
+    c_bat["run_btn"].click(
+        fn=lambda: toggle_run_btn(is_running=True),
+        inputs=None,
+        outputs=[c_bat["run_btn"], c_bat["stop_run_btn"]],
+        queue=False,
+    ).then(
+        fn=run_batch_detection_gui,
+        inputs=[
+            c_bat["input_images"],
+            c_bat["categories_input"],
+            c_bat["category_defs_input"],
+            c_srv["server_port_input"],
+            c_bat["use_external_api_chk"],
+            c_bat["ext_api_url"],
+            c_bat["ext_api_key"],
+            c_bat["ext_model_name"],
+            c_bat["rounds_slider"],
+            c_bat["score_threshold_slider"],
+            c_bat["det_temp_slider"],
+            c_bat["jdg_temp_slider"],
+            c_bat["concurrency_slider"],
+            c_pmt["customize_prompts_chk"],
+            c_pmt["custom_det_prompt"],
+            c_pmt["custom_jdg_prompt"],
+            c_bat["prep_enabled_chk"],
+            c_bat["prep_short_edge_slider"],
+            c_bat["prep_pad_square_chk"],
+            c_bat["prep_contrast_dropdown"],
+            c_bat["prep_gamma_slider"],
+            c_bat["prep_denoise_dropdown"],
+            c_bat["prep_sharpen_chk"],
+            c_bat["prep_wb_chk"],
+            c_bat["prep_grid_dropdown"],
+            c_bat["prep_som_chk"],
+            c_bat["prep_tiling_chk"],
+            c_bat["prep_tile_size_slider"],
+            c_bat["prep_tile_overlap_slider"],
+            c_bat["prep_cv_chk"],
+            c_bat["prep_cv_padding_slider"],
+            c_bat["prep_grid_step_slider"],
+            c_bat["prep_grid_line_width_slider"],
+            c_bat["prep_grid_font_size_slider"],
+            c_bat["prep_grid_line_color_dropdown"],
+            c_bat["prep_grid_line_color_custom"],
+            c_bat["prep_grid_text_color_dropdown"],
+            c_bat["prep_grid_text_color_custom"],
+            c_bat["prep_grid_backing_color_dropdown"],
+            c_bat["prep_grid_backing_color_custom"],
+            c_bat["prep_send_pixel_bounds_chk"],
+            c_bat["prep_min_pixels_num"],
+            c_bat["prep_max_pixels_num"],
+            c_bat["prep_custom_resize_chk"],
+            c_bat["prep_custom_resize_width"],
+            c_bat["prep_custom_resize_height"],
+        ],
+        outputs=[
+            c_bat["pipeline_status"],
+            c_bat["progress_html"],
+            c_bat["download_results_box"],
+            batch_id_state,
+            c_bat["explorer_image_select"],
+            c_bat["pipeline_logs_viewer"],
+            c_bat["batch_status_table"],
+        ],
+        concurrency_limit=1,
+    ).then(
+        fn=lambda: toggle_run_btn(is_running=False),
+        inputs=None,
+        outputs=[c_bat["run_btn"], c_bat["stop_run_btn"]],
+        queue=False,
+    )
+
+    c_bat["stop_run_btn"].click(
+        fn=cancel_pipeline,
+        outputs=[c_bat["pipeline_status"]],
+        queue=False,
+    )
+
+    # ── Explorer interactions ─────────────────────────────────────────────
+    _explorer_outputs = [
+        c_bat["source_image_viewer"],
+        c_bat["best_annotated_viewer"],
+        c_bat["round_score_display"],
+        c_bat["round_feedback_display"],
+        c_bat["round_raw_response_display"],
+        c_bat["round_parse_error_display"],
+        c_bat["detections_json_box"],
+    ]
+    _explorer_inputs = [
+        c_bat["explorer_image_select"],
+        c_bat["explorer_round_select"],
+        batch_id_state,
+        c_bat["show_grid_chk"],
+    ]
+
+    c_bat["explorer_image_select"].change(
+        on_explorer_image_change,
+        inputs=[c_bat["explorer_image_select"], batch_id_state],
+        outputs=[c_bat["explorer_round_select"]],
+    ).then(
+        on_explorer_round_change,
+        inputs=_explorer_inputs,
+        outputs=_explorer_outputs,
+    )
+
+    c_bat["explorer_round_select"].change(
+        on_explorer_round_change,
+        inputs=_explorer_inputs,
+        outputs=_explorer_outputs,
+    )
+
+    c_bat["show_grid_chk"].change(
+        on_explorer_round_change,
+        inputs=_explorer_inputs,
+        outputs=_explorer_outputs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# App Builder
+# ---------------------------------------------------------------------------
+
+
+def build_app() -> gr.Blocks:
+    with gr.Blocks(
+        theme=theme, css=custom_css, title="LLM Object Detection Console"
+    ) as app:
+        gr.HTML(CONSOLE_JS)
+
+        # ── Header with inline status badge ──────────────────────────────
+        gr.HTML(
+            """
+        <div class="app-header">
+            <div>
+                <h1><span>🔍</span> LLM Object Detection Console</h1>
+                <p>// vision-LLM detector/judge pipeline · local or external endpoint</p>
+            </div>
+            <div class="app-header-meta" id="header-status-meta">
+            </div>
+        </div>"""
+        )
+
+        server_status_badge = gr.HTML(
+            value='<span class="status-badge badge-stopped">STOPPED</span>',
+        )
+
+        batch_id_state = gr.State("")
+
+        with gr.Tabs():
+            with gr.TabItem("🦙 Llama Server"):
+                c_srv = _build_server_tab(server_status_badge)
+
+            with gr.TabItem("🧪 Batch Sandbox"):
+                c_bat = _build_batch_tab()
+
+            with gr.TabItem("✍️ Prompts"):
+                c_pmt = _build_prompts_tab()
+
+        # ── Wire all events ───────────────────────────────────────────────
+        _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state)
+
+        # ── Auto-refresh server status every 5 s ─────────────────────────
+        status_timer = gr.Timer(value=5.0)
+        app.load(
+            get_server_status_and_logs,
+            outputs=[c_srv["server_logs_viewer"], server_status_badge],
+        )
+        status_timer.tick(
+            get_server_status_and_logs,
+            outputs=[c_srv["server_logs_viewer"], server_status_badge],
+        )
+
+    return app
+
+
+if __name__ == "__main__":
+    demo = build_app()
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True, inline=True)

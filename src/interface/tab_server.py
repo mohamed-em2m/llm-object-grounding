@@ -2,175 +2,358 @@
 Llama Server tab UI and lifecycle server management logic.
 """
 
-import html
+import time
 import logging
 from typing import Dict, Any
 import gradio as gr
 
 from servers import LlamaServerManager
-from interface.state import server_manager, server_lock, _STATUS_PILL, LOG_TAIL_BYTES, MODEL_PRESETS, handle_preset_change
+from interface.state import (
+    state,
+    LOG_TAIL_BYTES,
+    MODEL_PRESETS,
+    panel_header,
+    _section_title,
+    handle_preset_change,
+)
 
 logger = logging.getLogger("detection_pipeline")
 
 
-def _get_server_status_html() -> str:
-    global server_manager
-    with server_lock:
-        if server_manager is None:
-            return '<span class="status-badge badge-stopped">STOPPED</span>'
-        if server_manager.process and server_manager.process.poll() is None:
-            url = f"http://{server_manager.host}:{server_manager.port}"
-            return f'<span class="status-badge badge-running">RUNNING</span> <a href="{url}/health" target="_blank" style="color:#7d8590; font-size:0.75rem; text-decoration:none;">({url})</a>'
-        elif server_manager.process and server_manager.process.poll() is not None:
-            exit_code = server_manager.process.poll()
-            return f'<span class="status-badge badge-error">CRASHED (Exit code {exit_code})</span>'
-        else:
-            return '<span class="status-badge badge-stopped">STOPPED</span>'
-
-
 def start_server_wrapper(
-    model_path, port, host, enable_thinking, enable_mtp, ctx_size, n_gpu_layers,
-    cache_type_k, img_min_tokens, img_max_tokens, parallel_slots, batch_size, ubatch_size,
+    model,
+    port,
+    host,
+    enable_thinking,
+    enable_mtp,
+    ctx_size,
+    gpu_layers,
+    kv_cache_type,
+    image_min_tokens,
+    image_max_tokens,
+    parallel_slots,
     disable_log=False,
 ):
-    global server_manager
-    with server_lock:
-        if server_manager is not None:
-            if server_manager.process and server_manager.process.poll() is None:
-                return server_manager.get_logs()[-LOG_TAIL_BYTES:], _get_server_status_html()
+    ctx_size = ctx_size * parallel_slots
 
-        if not model_path:
-            return "Error: Model path/name is required.", _get_server_status_html()
-
-        kwargs = {}
-        if ctx_size: kwargs["ctx_size"] = int(ctx_size)
-        if n_gpu_layers is not None and n_gpu_layers != -1: kwargs["gpu_layers"] = int(n_gpu_layers)
-        if cache_type_k: kwargs["kv_cache_type"] = cache_type_k
-        if img_min_tokens: kwargs["image_min_tokens"] = int(img_min_tokens)
-        if img_max_tokens: kwargs["image_max_tokens"] = int(img_max_tokens)
-        if parallel_slots: kwargs["parallel_slots"] = int(parallel_slots)
-        if batch_size: kwargs["batch_size"] = int(batch_size)
-        if ubatch_size: kwargs["ubatch_size"] = int(ubatch_size)
-
-        try:
-            spec_type = "draft-mtp" if enable_mtp else "none"
-            server_manager = LlamaServerManager(
-                model=model_path,
-                port=int(port),
-                host=host,
-                enable_thinking=enable_thinking,
-                spec_type=spec_type,
-                log_disable=bool(disable_log),
-                **kwargs,
+    with state.server_lock:
+        if state.server_manager is not None and state.server_manager.is_healthy():
+            yield (
+                "Server is already running and healthy.",
+                f'<span class="status-badge badge-running">RUNNING (Port {state.server_manager.port})</span>',
             )
-            server_manager.start_llama_server()
-            logs = server_manager.get_logs()[-LOG_TAIL_BYTES:]
-            return logs, _get_server_status_html()
-        except Exception as exc:
-            logger.exception("Failed to start server")
-            return f"Failed to start server: {exc}", '<span class="status-badge badge-error">ERROR</span>'
+            return
+
+        yield (
+            "Stopping any existing server instance...",
+            '<span class="status-badge badge-starting">CLEANING UP...</span>',
+        )
+        if state.server_manager is not None:
+            try:
+                state.server_manager.stop_llama_server()
+            except Exception as e:
+                logger.warning(f"Error stopping old server: {e}")
+            state.server_manager = None
+
+        yield (
+            "Configuring server...",
+            '<span class="status-badge badge-starting">INITIALIZING...</span>',
+        )
+
+        spec_type = "draft-mtp" if enable_mtp else "none"
+        state.server_manager = LlamaServerManager(
+            model=model,
+            host=host,
+            port=int(port),
+            ctx_size=int(ctx_size),
+            parallel_slots=parallel_slots,
+            n_threads=-1,
+            gpu_layers=int(gpu_layers),
+            tensor_split="1,1",
+            main_gpu=0,
+            temp=0.4,
+            top_p=0.95,
+            top_k=64,
+            spec_type=spec_type,
+            spec_draft_n_max=4 if enable_mtp else 0,
+            enable_thinking=enable_thinking,
+            batch_size=1024,
+            ubatch_size=512,
+            kv_cache_type=kv_cache_type,
+            image_min_tokens=(
+                int(image_min_tokens) if image_min_tokens is not None else 1024
+            ),
+            image_max_tokens=(
+                int(image_max_tokens) if image_max_tokens is not None else 4096
+            ),
+            log_disable=bool(disable_log),
+        )
+
+        yield (
+            "Spawning llama-server process...",
+            '<span class="status-badge badge-starting">STARTING...</span>',
+        )
+        try:
+            state.server_manager.start_llama_server()
+        except Exception as e:
+            state.server_manager = None
+            yield (
+                f"Failed to start server process: {e}",
+                '<span class="status-badge badge-error">PROCESS ERROR</span>',
+            )
+            return
+
+    start_time = time.time()
+    timeout = 180
+    healthy = False
+
+    while time.time() - start_time < timeout:
+        with state.server_lock:
+            if state.server_manager is None:
+                yield (
+                    "Server initialization aborted.",
+                    '<span class="status-badge badge-stopped">STOPPED</span>',
+                )
+                return
+            if (
+                state.server_manager.process
+                and state.server_manager.process.poll() is not None
+            ):
+                exit_code = state.server_manager.process.poll()
+                logs = state.server_manager.get_logs()
+                state.server_manager = None
+                yield (
+                    f"Server process exited with code {exit_code}.\n\n--- Logs ---\n{logs}",
+                    '<span class="status-badge badge-error">CRASHED</span>',
+                )
+                return
+            if state.server_manager.is_healthy():
+                healthy = True
+                break
+
+            logs = state.server_manager.get_logs()
+            elapsed = int(time.time() - start_time)
+            yield (
+                f"Waiting for model to load into memory... ({elapsed}s elapsed)\n\n--- Latest Output ---\n{logs[-1200:]}",
+                '<span class="status-badge badge-starting">STARTING...</span>',
+            )
+        time.sleep(2)
+
+    if healthy:
+        yield (
+            "Server is up. Running warmup request...",
+            '<span class="status-badge badge-starting">WARMING UP...</span>',
+        )
+        try:
+            with state.server_lock:
+                if state.server_manager:
+                    state.server_manager.warmup_model()
+            yield (
+                "Server started and warmed up. Ready for detection tasks.",
+                f'<span class="status-badge badge-running">RUNNING (Port {port})</span>',
+            )
+        except Exception as e:
+            yield (
+                f"Server is healthy, but warmup failed: {e}",
+                f'<span class="status-badge badge-running">RUNNING (Port {port})</span>',
+            )
+    else:
+        yield (
+            "Timed out waiting for the server to report healthy status.",
+            '<span class="status-badge badge-error">TIMEOUT</span>',
+        )
 
 
 def stop_server_wrapper():
-    global server_manager
-    with server_lock:
-        if server_manager is not None:
-            try:
-                server_manager.stop_llama_server()
-            except Exception as exc:
-                logger.warning("Error stopping server: %s", exc)
-            logs = server_manager.get_logs()[-LOG_TAIL_BYTES:]
-            server_manager = None
-            return logs, '<span class="status-badge badge-stopped">STOPPED</span>'
-        return "Server is not running.", '<span class="status-badge badge-stopped">STOPPED</span>'
+    with state.server_lock:
+        if state.server_manager is None:
+            return (
+                "No server running.",
+                '<span class="status-badge badge-stopped">STOPPED</span>',
+            )
+        try:
+            state.server_manager.stop_llama_server()
+            state.server_manager = None
+            return (
+                "Server stopped successfully.",
+                '<span class="status-badge badge-stopped">STOPPED</span>',
+            )
+        except Exception as e:
+            return (
+                f"Error stopping server: {e}",
+                '<span class="status-badge badge-error">STOP ERROR</span>',
+            )
 
 
 def get_server_status_and_logs():
-    global server_manager
-    with server_lock:
-        if server_manager is None:
-            return "", '<span class="status-badge badge-stopped">STOPPED</span>'
-        logs = server_manager.get_logs()[-LOG_TAIL_BYTES:]
-        return logs, _get_server_status_html()
+    with state.server_lock:
+        if state.server_manager is None:
+            return (
+                "No server instance exists.",
+                '<span class="status-badge badge-stopped">STOPPED</span>',
+            )
+        if (
+            state.server_manager.process
+            and state.server_manager.process.poll() is not None
+        ):
+            exit_code = state.server_manager.process.poll()
+            return (
+                f"Server process is dead (Exit code: {exit_code}).\n\n--- Logs ---\n{state.server_manager.get_logs()}",
+                '<span class="status-badge badge-error">CRASHED</span>',
+            )
+        logs = state.server_manager.get_logs()
+        if state.server_manager.is_healthy():
+            return (
+                f"Server is healthy and running.\n\n--- Logs ---\n{logs[-2000:]}",
+                f'<span class="status-badge badge-running">RUNNING (Port {state.server_manager.port})</span>',
+            )
+        return (
+            f"Server is starting or unhealthy.\n\n--- Logs ---\n{logs[-2000:]}",
+            '<span class="status-badge badge-starting">STARTING...</span>',
+        )
 
 
 def _build_server_tab(server_status_badge: gr.HTML) -> Dict[str, Any]:
-    gr.HTML('<p class="section-label">Server Instance Manager</p>')
+    """Build the Llama Server tab and return all interactive components."""
 
-    with gr.Row():
-        with gr.Column(scale=1):
+    gr.HTML('<p class="section-label">Model Server Configuration</p>')
+    with gr.Row(equal_height=False):
+        # ── Left: Config ──────────────────────────────────────────────────
+        with gr.Column(scale=2):
+            gr.HTML(
+                '<div class="config-card"><div class="config-card-title">🦙 Model Selection</div>'
+            )
             server_preset = gr.Dropdown(
-                label="Model Preset",
+                label="Recommended Model Presets",
                 choices=MODEL_PRESETS,
-                value=MODEL_PRESETS[0],
+                value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
+                interactive=True,
             )
             server_model_input = gr.Textbox(
-                label="Model (HuggingFace repo/file or local path)",
-                value=MODEL_PRESETS[0],
+                label="Model GGUF Path or HF Repo ID",
+                value="unsloth/gemma-4-26B-A4B-it-qat-GGUF:UD-Q4_K_XL",
+                placeholder="e.g. C:/models/qwen.gguf or HF ID",
+                interactive=True,
+            )
+            gr.HTML("</div>")
+
+            gr.HTML(
+                '<div class="config-card"><div class="config-card-title">⚙️ Runtime Options</div>'
+            )
+            server_port_input = gr.Number(
+                label="Port Number",
+                value=8080,
+                precision=0,
+                interactive=True,
             )
             with gr.Row():
-                server_host_input = gr.Textbox(label="Host", value="127.0.0.1", scale=2)
-                server_port_input = gr.Number(label="Port", value=8080, precision=0, scale=1)
+                server_thinking_chk = gr.Checkbox(
+                    label="Thinking Mode", value=False, interactive=True
+                )
+                server_mtp_chk = gr.Checkbox(
+                    label="MTP Speculative Drafting",
+                    value=True,
+                    interactive=True,
+                )
+            gr.HTML("</div>")
 
-            with gr.Row():
-                server_thinking_chk = gr.Checkbox(label="Enable Thinking Mode", value=True)
-                server_mtp_chk = gr.Checkbox(label="Enable MTP Mode", value=True)
-
-            with gr.Accordion("Advanced Server Flags", open=False):
+            with gr.Accordion("Advanced Server Parameters", open=False):
+                gr.HTML(_section_title("🖧", "Network"))
+                server_host_input = gr.Textbox(label="Host Binding", value="0.0.0.0")
+                gr.HTML(_section_title("🎛️", "Compute"))
+                server_ctx_input = gr.Number(
+                    label="Context Size per Slot",
+                    value=15000,
+                    precision=0,
+                )
+                server_parallel_slots_input = gr.Number(
+                    label="Parallel Slots", value=2, precision=0
+                )
+                server_gpu_layers = gr.Number(
+                    label="GPU Layers (-ngl)", value=-1, precision=0
+                )
+                server_kv_cache = gr.Dropdown(
+                    label="KV Cache Type",
+                    choices=[
+                        "f32",
+                        "f16",
+                        "bf16",
+                        "q8_0",
+                        "q4_0",
+                        "q4_1",
+                        "iq4_nl",
+                        "q5_0",
+                        "q5_1",
+                    ],
+                    value="q4_0",
+                )
+                gr.HTML(_section_title("🖼️", "Vision / Image Tokens"))
                 with gr.Row():
-                    server_ctx_input = gr.Number(label="Context Size (-c)", value=16384, precision=0)
-                    server_gpu_layers = gr.Number(label="GPU Layers (-ngl)", value=-1, precision=0)
-                with gr.Row():
-                    server_cache_type = gr.Dropdown(
-                        label="KV Cache K Type (-ctk)",
-                        choices=["f16", "q8_0", "q4_0"],
-                        value="q8_0",
+                    server_img_min_tokens = gr.Number(
+                        label="Min Image Tokens (--image-min-tokens)",
+                        value=1024,
+                        precision=0,
+                        info="Minimum tokens for image encoding. Lower = faster but lower quality.",
                     )
-                    server_parallel_slots = gr.Number(label="Parallel Slots (-np)", value=1, precision=0)
+                    server_img_max_tokens = gr.Number(
+                        label="Max Image Tokens (--image-max-tokens)",
+                        value=4096,
+                        precision=0,
+                        info="Maximum tokens for image encoding. Higher = more detail but slower.",
+                    )
                 with gr.Row():
-                    server_img_min = gr.Number(label="Min Image Tokens", value=1024, precision=0)
-                    server_img_max = gr.Number(label="Max Image Tokens", value=4096, precision=0)
-                with gr.Row():
-                    server_batch_size = gr.Number(label="Batch Size (-b)", value=2048, precision=0)
-                    server_ubatch_size = gr.Number(label="Micro Batch Size (-ub)", value=512, precision=0)
-                with gr.Row():
-                    server_log_disable = gr.Checkbox(label="Disable Server Console Logs (--log-disable)", value=False)
+                    server_log_disable = gr.Checkbox(
+                        label="Disable Server Console Logs (--log-disable)",
+                        value=False,
+                    )
 
+            gr.HTML('<div class="btn-group" style="margin-top:0.75rem;">')
             with gr.Row():
-                start_server_btn = gr.Button("🚀 Start Server", variant="primary", scale=2)
-                stop_server_btn = gr.Button("🛑 Stop Server", variant="stop", scale=1)
+                start_server_btn = gr.Button("▶  Start Server", variant="primary")
+                stop_server_btn = gr.Button(
+                    "⏹  Stop Server", variant="secondary", size="sm"
+                )
+                refresh_logs_btn = gr.Button(
+                    "🔄 Refresh Logs",
+                    variant="secondary",
+                    size="sm",
+                )
+            gr.HTML("</div>")
 
-        with gr.Column(scale=1):
-            gr.HTML('<p class="section-label">Server Logs</p>')
-            server_logs_viewer = gr.Code(
-                value="",
-                language="markdown",
-                label="stdout / stderr",
-                lines=18,
-                interactive=False,
+        # ── Right: Logs ───────────────────────────────────────────────────
+        with gr.Column(scale=3):
+            gr.HTML('<p class="section-label">Server Output Console</p>')
+            gr.HTML(
+                '<div class="output-panel" id="server-log-panel">'
+                + panel_header("Live Logs", "server-log-ta")
             )
-            refresh_logs_btn = gr.Button("🔄 Refresh Logs", size="sm")
-            log_timer = gr.Timer(2.0)
+            with gr.Group(elem_classes=["out-md-wrap"]):
+                server_logs_viewer = gr.Textbox(
+                    lines=22,
+                    max_lines=32,
+                    interactive=False,
+                    show_label=False,
+                    container=False,
+                    elem_id="server-log-ta",
+                )
+            gr.HTML("</div>")
 
     return dict(
         server_preset=server_preset,
         server_model_input=server_model_input,
-        server_host_input=server_host_input,
         server_port_input=server_port_input,
+        server_host_input=server_host_input,
         server_thinking_chk=server_thinking_chk,
         server_mtp_chk=server_mtp_chk,
         server_ctx_input=server_ctx_input,
+        server_parallel_slots_input=server_parallel_slots_input,
         server_gpu_layers=server_gpu_layers,
-        server_kv_cache=server_cache_type,
-        server_parallel_slots_input=server_parallel_slots,
-        server_img_min_tokens=server_img_min,
-        server_img_max_tokens=server_img_max,
-        server_batch_size=server_batch_size,
-        server_ubatch_size=server_ubatch_size,
+        server_kv_cache=server_kv_cache,
+        server_img_min_tokens=server_img_min_tokens,
+        server_img_max_tokens=server_img_max_tokens,
         server_log_disable=server_log_disable,
         start_server_btn=start_server_btn,
         stop_server_btn=stop_server_btn,
-        server_logs_viewer=server_logs_viewer,
         refresh_logs_btn=refresh_logs_btn,
-        log_timer=log_timer,
+        server_logs_viewer=server_logs_viewer,
     )

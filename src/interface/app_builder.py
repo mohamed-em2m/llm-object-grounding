@@ -5,8 +5,13 @@ Aggregator application builder assembling interface tabs, CSS styling, and event
 import gradio as gr
 
 from interface.console_theme import theme
-from interface.state import custom_css, CONSOLE_JS
-from interface.tab_server import _build_server_tab, get_server_status_and_logs
+from interface.state import custom_css, CONSOLE_JS, handle_preset_change, toggle_custom_color_field
+from interface.tab_server import (
+    _build_server_tab,
+    start_server_wrapper,
+    stop_server_wrapper,
+    get_server_status_and_logs,
+)
 from interface.tab_batch import (
     _build_batch_tab,
     toggle_external_api,
@@ -22,9 +27,8 @@ from interface.tab_realtime import _build_realtime_tab, _wire_realtime_events
 
 def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
     """Wire all event handlers across server, batch, and prompt tabs."""
-    from interface.state import handle_preset_change
-    from interface.tab_server import start_server_wrapper, stop_server_wrapper
 
+    # ── Server tab ────────────────────────────────────────────────────────
     c_srv["server_preset"].change(
         handle_preset_change,
         c_srv["server_preset"],
@@ -45,28 +49,49 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
             c_srv["server_img_min_tokens"],
             c_srv["server_img_max_tokens"],
             c_srv["server_parallel_slots_input"],
-            c_srv["server_batch_size"],
-            c_srv["server_ubatch_size"],
             c_srv["server_log_disable"],
         ],
         outputs=[c_srv["server_logs_viewer"], server_status_badge],
     )
-
     c_srv["stop_server_btn"].click(
         stop_server_wrapper,
         outputs=[c_srv["server_logs_viewer"], server_status_badge],
     )
-
     c_srv["refresh_logs_btn"].click(
         get_server_status_and_logs,
         outputs=[c_srv["server_logs_viewer"], server_status_badge],
     )
 
-    c_srv["log_timer"].tick(
-        get_server_status_and_logs,
-        outputs=[c_srv["server_logs_viewer"], server_status_badge],
+    # ── Batch tab — preprocessing toggles ────────────────────────────────
+    c_bat["prep_enabled_chk"].change(
+        lambda v: gr.update(visible=v),
+        inputs=[c_bat["prep_enabled_chk"]],
+        outputs=[c_bat["prep_options_group"]],
     )
 
+    c_bat["prep_custom_resize_chk"].change(
+        lambda v: gr.update(visible=v),
+        inputs=[c_bat["prep_custom_resize_chk"]],
+        outputs=[c_bat["prep_custom_resize_row"]],
+    )
+
+    for dd, custom_field in [
+        (c_bat["prep_grid_line_color_dropdown"], c_bat["prep_grid_line_color_custom"]),
+        (c_bat["prep_grid_text_color_dropdown"], c_bat["prep_grid_text_color_custom"]),
+        (
+            c_bat["prep_grid_backing_color_dropdown"],
+            c_bat["prep_grid_backing_color_custom"],
+        ),
+    ]:
+        dd.change(toggle_custom_color_field, inputs=[dd], outputs=[custom_field])
+
+    c_bat["prep_send_pixel_bounds_chk"].change(
+        lambda v: gr.update(visible=v),
+        inputs=[c_bat["prep_send_pixel_bounds_chk"]],
+        outputs=[c_bat["prep_pixel_bounds_row"]],
+    )
+
+    # ── External API toggle ───────────────────────────────────────────────
     c_bat["use_external_api_chk"].change(
         toggle_external_api,
         inputs=[c_bat["use_external_api_chk"]],
@@ -82,6 +107,7 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
         ],
     )
 
+    # ── Run / Cancel ──────────────────────────────────────────────────────
     c_bat["run_btn"].click(
         fn=lambda: toggle_run_btn(is_running=True),
         inputs=None,
@@ -131,13 +157,11 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
             c_bat["prep_grid_backing_color_dropdown"],
             c_bat["prep_grid_backing_color_custom"],
             c_bat["prep_send_pixel_bounds_chk"],
-            c_bat["prep_min_pixels"],
-            c_bat["prep_max_pixels"],
+            c_bat["prep_min_pixels_num"],
+            c_bat["prep_max_pixels_num"],
             c_bat["prep_custom_resize_chk"],
             c_bat["prep_custom_resize_width"],
             c_bat["prep_custom_resize_height"],
-            c_bat["judge_thinking_chk"],
-            c_bat["feedback_image_mode_dropdown"],
         ],
         outputs=[
             c_bat["pipeline_status"],
@@ -162,6 +186,7 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
         queue=False,
     )
 
+    # ── Explorer interactions ─────────────────────────────────────────────
     _explorer_outputs = [
         c_bat["source_image_viewer"],
         c_bat["best_annotated_viewer"],
@@ -207,7 +232,9 @@ def build_app() -> gr.Blocks:
     ) as app:
         gr.HTML(CONSOLE_JS)
 
-        gr.HTML("""
+        # ── Header with inline status badge ──────────────────────────────
+        gr.HTML(
+            """
         <div class="app-header">
             <div>
                 <h1><span>🔍</span> LLM Object Detection Console</h1>
@@ -215,7 +242,8 @@ def build_app() -> gr.Blocks:
             </div>
             <div class="app-header-meta" id="header-status-meta">
             </div>
-        </div>""")
+        </div>"""
+        )
 
         server_status_badge = gr.HTML(
             value='<span class="status-badge badge-stopped">STOPPED</span>',
@@ -224,9 +252,6 @@ def build_app() -> gr.Blocks:
         batch_id_state = gr.State("")
 
         with gr.Tabs():
-            with gr.TabItem("⚡ Real-Time & Video"):
-                c_real = _build_realtime_tab()
-
             with gr.TabItem("🦙 Llama Server"):
                 c_srv = _build_server_tab(server_status_badge)
 
@@ -236,9 +261,14 @@ def build_app() -> gr.Blocks:
             with gr.TabItem("✍️ Prompts"):
                 c_pmt = _build_prompts_tab()
 
-        _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state)
-        _wire_realtime_events(c_real, c_srv, c_bat)
+            with gr.TabItem("🎥 Real-Time Detection"):
+                c_rt = _build_realtime_tab()
 
+        # ── Wire all events ───────────────────────────────────────────────
+        _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state)
+        _wire_realtime_events(c_rt, c_srv, c_bat)
+
+        # ── Auto-refresh server status every 5 s ─────────────────────────
         status_timer = gr.Timer(value=5.0)
         app.load(
             get_server_status_and_logs,
