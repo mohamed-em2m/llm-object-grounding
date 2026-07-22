@@ -1,23 +1,76 @@
 """
-Real-time webcam streaming & video 1-second frame detection tab UI and processing functions.
+Real-time webcam streaming & video frame detection tab UI and processing functions.
 """
 
 import io
 import time
 import html
+import threading
 from typing import Dict, Any, Optional, List
 import gradio as gr
 from PIL import Image
 import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from openai import OpenAI
 
 from free_detection.detection_pipeline import (
     ObjectDetectionPipeline,
-    draw_grid,
     pil_to_data_uri,
     parse_detections,
     validate_detections,
 )
+
+# ---------------------------------------------------------------------------
+# Global Lock & Cache for Real-Time Non-Blocking Frame Dropping
+# ---------------------------------------------------------------------------
+_realtime_lock = threading.Lock()
+_last_annotated_frame: Optional[np.ndarray] = None
+_last_hud_info: str = '<div class="neo-retro-hud-stat">STATUS: INITIALIZED</div>'
+
+
+def draw_boxes_opencv(image_np: np.ndarray, boxes: List[Any]) -> np.ndarray:
+    """Fast OpenCV bounding box rendering (<1ms vs ~200ms for Matplotlib)."""
+    if cv2 is None:
+        return image_np
+
+    img = image_np.copy()
+    for box in boxes:
+        if len(box) >= 4:
+            ymin, xmin, ymax, xmax = box[:4]
+            label = str(box[4]) if len(box) >= 5 else ""
+
+            pt1 = (int(xmin), int(ymin))
+            pt2 = (int(xmax), int(ymax))
+
+            # Draw vibrant cyber cyan bounding box (#00ffcc -> BGR (204, 255, 0))
+            cv2.rectangle(img, pt1, pt2, (204, 255, 0), 2)
+
+            if label:
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.5
+                thickness = 1
+                (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, thickness)
+
+                lbl_pt1 = (int(xmin), max(0, int(ymin) - text_h - 6))
+                lbl_pt2 = (int(xmin) + text_w + 6, max(text_h + 6, int(ymin)))
+                cv2.rectangle(img, lbl_pt1, lbl_pt2, (204, 255, 0), -1)
+
+                cv2.putText(
+                    img,
+                    label,
+                    (int(xmin) + 3, max(text_h + 2, int(ymin) - 3)),
+                    font,
+                    font_scale,
+                    (17, 8, 5),
+                    thickness,
+                    cv2.LINE_AA,
+                )
+    return img
 
 
 def process_single_frame(
@@ -29,13 +82,33 @@ def process_single_frame(
     ext_api_key: str,
     ext_model_name: str,
     confidence_thresh: float,
+    max_resolution: int = 640,
 ) -> tuple[Optional[np.ndarray], str]:
+    global _last_annotated_frame, _last_hud_info
+
     if frame is None:
-        return None, '<div class="neo-retro-hud-stat">STATUS: READY</div>'
+        return _last_annotated_frame, '<div class="neo-retro-hud-stat">STATUS: READY</div>'
+
+    # Non-blocking lock: if model is busy processing previous frame, drop this incoming stream frame
+    acquired = _realtime_lock.acquire(blocking=False)
+    if not acquired:
+        return _last_annotated_frame, _last_hud_info
 
     start_time = time.time()
     try:
         pil_img = Image.fromarray(frame).convert("RGB")
+
+        # Downscale for real-time VLM inference speed if frame exceeds max_resolution
+        orig_w, orig_h = pil_img.size
+        max_res = int(max_resolution or 640)
+        if max(orig_w, orig_h) > max_res:
+            scale = max_res / float(max(orig_w, orig_h))
+            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+            proc_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+        else:
+            proc_img = pil_img
+            new_w, new_h = orig_w, orig_h
+
         categories = [c.strip() for c in categories_str.split(",") if c.strip()]
         if not categories:
             categories = ["object"]
@@ -49,7 +122,7 @@ def process_single_frame(
         client = OpenAI(base_url=base_url, api_key=api_key)
         pipeline = ObjectDetectionPipeline(client=client, detector_model=model_name)
 
-        img_uri = pil_to_data_uri(pil_img)
+        img_uri = pil_to_data_uri(proc_img)
         raw_output = pipeline.run_inference(
             image_uris=img_uri,
             categories=categories,
@@ -63,71 +136,33 @@ def process_single_frame(
             bbox = d.get("bbox_2d", [])
             lbl = d.get("label", "")
             if len(bbox) == 4:
-                # Convert 0-1000 scale [x1, y1, x2, y2] to image coordinates [ymin, xmin, ymax, xmax, label]
+                # Convert 0-1000 normalized coordinates to original frame pixel space
                 x1, y1, x2, y2 = bbox
-                ymin = y1 * pil_img.height / 1000.0
-                xmin = x1 * pil_img.width / 1000.0
-                ymax = y2 * pil_img.height / 1000.0
-                xmax = x2 * pil_img.width / 1000.0
+                ymin = y1 * orig_h / 1000.0
+                xmin = x1 * orig_w / 1000.0
+                ymax = y2 * orig_h / 1000.0
+                xmax = x2 * orig_w / 1000.0
                 boxes.append([ymin, xmin, ymax, xmax, lbl])
 
-        annotated_img = draw_grid(pil_img, style="none")
-        annotated_np = draw_boxes_on_image(annotated_img, boxes)
+        annotated_np = draw_boxes_opencv(np.array(pil_img), boxes)
 
-        elapsed = (time.time() - start_time) * 1000
+        elapsed = (time.time() - start_time) * 1000.0
+        fps = 1000.0 / max(elapsed, 1.0)
         hud_info = (
-            f'<div class="neo-retro-hud-stat">FPS: {1000/max(elapsed, 1):.1f} | '
+            f'<div class="neo-retro-hud-stat">FPS: {fps:.1f} | '
             f"LATENCY: {elapsed:.0f}ms | DETECTED: {len(boxes)}</div>"
         )
+
+        _last_annotated_frame = annotated_np
+        _last_hud_info = hud_info
+
         return annotated_np, hud_info
+
     except Exception as e:
-        return (
-            frame,
-            f'<div class="neo-retro-hud-stat" style="color:#ff0055 !important;">ERROR: {html.escape(str(e))}</div>',
-        )
-
-
-def draw_boxes_on_image(image: Image.Image, boxes: List[Any]) -> np.ndarray:
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-
-    fig, ax = plt.subplots(figsize=(image.width / 100, image.height / 100), dpi=100)
-    ax.imshow(image)
-    ax.axis("off")
-    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-
-    for box in boxes:
-        if len(box) >= 4:
-            ymin, xmin, ymax, xmax = box[:4]
-            label = str(box[4]) if len(box) >= 5 else ""
-            rect = patches.Rectangle(
-                (xmin, ymin),
-                xmax - xmin,
-                ymax - ymin,
-                linewidth=2,
-                edgecolor="#00ffcc",
-                facecolor="none",
-            )
-            ax.add_patch(rect)
-            if label:
-                ax.text(
-                    xmin,
-                    max(0, ymin - 5),
-                    label,
-                    color="#050811",
-                    fontsize=10,
-                    fontweight="bold",
-                    bbox=dict(
-                        boxstyle="square,pad=0.2", facecolor="#00ffcc", edgecolor="none"
-                    ),
-                )
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
-    buf.seek(0)
-    res_img = Image.open(buf).convert("RGB")
-    return np.array(res_img)
+        err_hud = f'<div class="neo-retro-hud-stat" style="color:#ff0055 !important;">ERROR: {html.escape(str(e))}</div>'
+        return frame, err_hud
+    finally:
+        _realtime_lock.release()
 
 
 def process_video_frames(
@@ -139,12 +174,14 @@ def process_video_frames(
     ext_api_url: str,
     ext_api_key: str,
     ext_model_name: str,
+    max_resolution: int = 640,
     progress=gr.Progress(),
 ) -> tuple[List[np.ndarray], str]:
     if not video_path:
         return [], "No video file uploaded."
 
-    import cv2
+    if cv2 is None:
+        return [], "OpenCV (cv2) is required for video processing."
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -178,6 +215,7 @@ def process_video_frames(
             ext_api_key,
             ext_model_name,
             0.3,
+            max_resolution,
         )
         if ann is not None:
             annotated_frames.append(ann)
@@ -207,6 +245,14 @@ def _build_realtime_tab() -> Dict[str, Any]:
                 c["categories_input"] = gr.Textbox(
                     value="person, car, dog, bottle, phone",
                     label="TARGET CATEGORIES (comma-separated)",
+                )
+                c["max_resolution"] = gr.Slider(
+                    minimum=384,
+                    maximum=1084,
+                    step=128,
+                    value=640,
+                    label="MAX FRAME RESOLUTION (PX)",
+                    info="Lower resolution = faster real-time processing and lower latency.",
                 )
                 c["sample_interval"] = gr.Slider(
                     minimum=0.5,
@@ -282,9 +328,10 @@ def _wire_realtime_events(
             c_bat["ext_api_key"],
             c_bat["ext_model_name"],
             gr.State(0.3),
+            c_real["max_resolution"],
         ],
         outputs=[c_real["annotated_stream_output"], c_real["hud_status"]],
-        stream_every=0.5,
+        stream_every=0.3,
     )
 
     c_real["process_video_btn"].click(
@@ -298,6 +345,7 @@ def _wire_realtime_events(
             c_bat["ext_api_url"],
             c_bat["ext_api_key"],
             c_bat["ext_model_name"],
+            c_real["max_resolution"],
         ],
         outputs=[c_real["video_gallery_output"], c_real["hud_status"]],
     )

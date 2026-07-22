@@ -71,9 +71,11 @@ class PipelineConfig(BaseModel):
     # llama.cpp-specific
     enable_thinking: bool = False
     use_mtp: bool = True
-    ctx_size: int = 20000
+    ctx_size: int = 10000
     port: int = 8080
     parallel_slots: int = 1
+    server_batch_size: int = 1024
+    ubatch_size: int = 512
 
     # --- Detection pipeline tuning ----------------------------------------
     max_rounds: int = 2
@@ -246,7 +248,9 @@ class PipelineConfig(BaseModel):
 
         # 3. Concurrency & Queue Capacity
         # vLLM max_num_seqs determines simultaneously active request slots
-        args["--parallel"] = self.parallel_slots if self.parallel_slots else self.max_num_seqs
+        args["--parallel"] = (
+            self.parallel_slots if self.parallel_slots else self.max_num_seqs
+        )
 
         # 4. Multi-GPU Splitting & Execution Controls
         args["--gpu-layers"] = 999  # Mandate all layer processing offloads to GPU

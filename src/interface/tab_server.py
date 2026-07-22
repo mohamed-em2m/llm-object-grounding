@@ -32,6 +32,8 @@ def start_server_wrapper(
     image_min_tokens,
     image_max_tokens,
     parallel_slots,
+    batch_size=2048,
+    ubatch_size=512,
     disable_log=False,
 ):
     ctx_size = ctx_size * parallel_slots
@@ -77,8 +79,8 @@ def start_server_wrapper(
             spec_type=spec_type,
             spec_draft_n_max=4 if enable_mtp else 0,
             enable_thinking=enable_thinking,
-            batch_size=1024,
-            ubatch_size=512,
+            batch_size=int(batch_size) if batch_size else 2048,
+            ubatch_size=int(ubatch_size) if ubatch_size else 512,
             kv_cache_type=kv_cache_type,
             image_min_tokens=(
                 int(image_min_tokens) if image_min_tokens is not None else 1024

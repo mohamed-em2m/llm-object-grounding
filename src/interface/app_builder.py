@@ -49,6 +49,8 @@ def _wire_events(c_srv, c_bat, c_pmt, server_status_badge, batch_id_state):
             c_srv["server_img_min_tokens"],
             c_srv["server_img_max_tokens"],
             c_srv["server_parallel_slots_input"],
+            c_srv["server_batch_size"],
+            c_srv["server_ubatch_size"],
             c_srv["server_log_disable"],
         ],
         outputs=[c_srv["server_logs_viewer"], server_status_badge],
