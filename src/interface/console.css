@@ -37,6 +37,14 @@
     0%, 100% { box-shadow: 0 0 6px rgba(251, 191, 36, 0.4); opacity: 1; }
     50%       { box-shadow: 0 0 14px rgba(251, 191, 36, 0.9); opacity: 0.85; }
 }
+@keyframes neo-pulse-magenta {
+    0%, 100% { box-shadow: 0 0 10px rgba(255, 0, 128, 0.6), inset 0 0 5px rgba(255, 0, 128, 0.4); }
+    50%       { box-shadow: 0 0 22px rgba(255, 0, 128, 0.9), inset 0 0 10px rgba(255, 0, 128, 0.7); }
+}
+@keyframes neo-scanline {
+    0% { background-position: 0 0; }
+    100% { background-position: 0 100%; }
+}
 @keyframes progress-stripe {
     0%   { background-position: 0 0; }
     100% { background-position: 40px 0; }
@@ -49,6 +57,46 @@
 @keyframes fade-in {
     from { opacity: 0; transform: translateY(4px); }
     to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Neo-Retro Theme Classes */
+.neo-retro-card {
+    background: #0d0f18 !important;
+    border: 2px solid #00ffcc !important;
+    box-shadow: 4px 4px 0px #ff007f, 0 0 12px rgba(0, 255, 204, 0.3) !important;
+    border-radius: 4px !important;
+    position: relative;
+    overflow: hidden;
+}
+.neo-retro-card::before {
+    content: "NEO-RETRO VISION HUD v1.0";
+    display: block;
+    background: #ff007f;
+    color: #000;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    font-weight: 800;
+    padding: 2px 8px;
+    letter-spacing: 0.1em;
+}
+.neo-retro-badge {
+    display: inline-block;
+    background: #00ffcc;
+    color: #050811;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 2px;
+    box-shadow: 2px 2px 0px #ff007f;
+    text-transform: uppercase;
+}
+.neo-retro-hud-stat {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-weight: bold;
+    color: #00ffcc !important;
+    text-shadow: 0 0 5px rgba(0, 255, 204, 0.8);
+    font-size: 1.1rem !important;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
