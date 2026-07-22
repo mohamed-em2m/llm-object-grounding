@@ -40,8 +40,7 @@ from free_detection.image_preprocessing import (
     preprocess_resolution,
     map_bbox_to_original,
 )
-from free_detection.bytetrack import ByteTracker
-from free_detection.siamonnx import SiamONNXTracker
+from free_detection.trackers import MultiAlgorithmTracker
 
 DEFAULT_HUD = '<div class="neo-retro-hud-stat">STATUS: INITIALIZED</div>'
 
@@ -83,8 +82,7 @@ class SessionDetector:
         )
     )
     future: Optional[Future] = None
-    tracker: ByteTracker = field(default_factory=lambda: ByteTracker(high_thresh=0.4, low_thresh=0.1))
-    siam_tracker: SiamONNXTracker = field(default_factory=SiamONNXTracker)
+    multi_tracker: MultiAlgorithmTracker = field(default_factory=MultiAlgorithmTracker)
     last_raw_boxes: List[Any] = field(default_factory=list)
     last_tracked_boxes: List[Any] = field(default_factory=list)
     last_hud: str = DEFAULT_HUD
@@ -95,6 +93,7 @@ class SessionDetector:
 
     reference_gray: Optional[np.ndarray] = None
     last_detect_time: float = 0.0
+    _last_submitted_frame: Optional[np.ndarray] = None
 
     def next_frame_id(self) -> int:
         return next(self._frame_counter)
@@ -120,22 +119,22 @@ class SessionDetector:
                 self.last_applied_frame_id = frame_id
                 if boxes is not None:
                     self.last_raw_boxes = boxes
-                    # Feed new VLM predictions into ByteTracker & SiamONNXTracker
-                    formatted_dets = []
-                    for b in boxes:
-                        if len(b) >= 4:
-                            lbl = b[4] if len(b) >= 5 else ""
-                            formatted_dets.append([b[0], b[1], b[2], b[3], lbl, 0.9])
-                    self.last_tracked_boxes = self.tracker.update(formatted_dets)
+                    # Update active tracker with fresh VLM detections
+                    tracked = self.multi_tracker.update_with_detections(
+                        frame=self._last_submitted_frame, detections=boxes
+                    )
+                    if tracked:
+                        self.last_tracked_boxes = tracked
                 self.last_hud = hud
 
-    def update_tracking_only(self, frame: Optional[np.ndarray] = None) -> List[Any]:
-        """Runs SiamONNXTracker / ByteTracker tick when no new VLM detection has completed."""
+    def update_tracking_only(self, frame: Optional[np.ndarray], algorithm: str) -> List[Any]:
+        """Runs tracking tick on active algorithm when no new VLM detection has completed."""
         with self.lock:
-            if frame is not None and self.siam_tracker.active_tracks:
-                siam_boxes = self.siam_tracker.track_only(frame)
-                if siam_boxes:
-                    self.last_tracked_boxes = siam_boxes
+            self._last_submitted_frame = frame
+            self.multi_tracker.set_algorithm(algorithm)
+            tracked = self.multi_tracker.track_frame_only(frame, self.last_tracked_boxes)
+            if tracked:
+                self.last_tracked_boxes = tracked
             return list(self.last_tracked_boxes)
 
     def snapshot(self):
@@ -288,6 +287,7 @@ def process_single_frame(
     max_resolution: int,
     motion_sensitivity_pct: float,
     stale_refresh_seconds: float,
+    tracker_algorithm: str,
     session: SessionDetector,
 ) -> tuple[dict, str, SessionDetector]:
     """
@@ -307,8 +307,8 @@ def process_single_frame(
     pil_img = Image.fromarray(frame).convert("RGB")
     frame_h, frame_w = frame.shape[0], frame.shape[1]
 
-    # 1) Execute tracker update (SiamONNXTracker / ByteTrack) for continuous tracking
-    tracked_boxes = session.update_tracking_only(frame)
+    # 1) Execute chosen tracker update for continuous frame tracking
+    tracked_boxes = session.update_tracking_only(frame, tracker_algorithm)
     hud = session.last_hud
 
     # 2) Dispatch background detection when ready
@@ -471,6 +471,12 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     value="Webcam Stream",
                     label="STREAM INPUT SOURCE",
                 )
+                c["tracker_algorithm"] = gr.Dropdown(
+                    choices=MultiAlgorithmTracker.SUPPORTED_ALGOS,
+                    value="ByteTrack",
+                    label="REAL-TIME TRACKING ALGORITHM",
+                    info="Choose tracker engine: ByteTrack, SiamONNX, MOSSE, KCF, CSRT, or VitTracker.",
+                )
                 c["categories_input"] = gr.Textbox(
                     value="person, car, dog, bottle, phone",
                     label="TARGET CATEGORIES (comma-separated)",
@@ -588,6 +594,7 @@ def _wire_realtime_events(
             c_real["max_resolution"],
             c_real["motion_sensitivity"],
             c_real["stale_refresh"],
+            c_real["tracker_algorithm"],
             c_real["session_state"],
         ],
         outputs=[
