@@ -52,6 +52,11 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     value="person, car, dog, bottle, phone",
                     label="TARGET CATEGORIES (comma-separated)",
                 )
+                c["enable_resizing"] = gr.Checkbox(
+                    value=True,
+                    label="ENABLE IMAGE RESIZING / RESHAPING",
+                    info="When unchecked, the image is passed to VLM at native resolution without resizing.",
+                )
                 c["max_resolution"] = gr.Slider(
                     minimum=384,
                     maximum=4096,
@@ -59,6 +64,7 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     value=640,
                     label="MAX FRAME RESOLUTION (PX)",
                     info="Lower resolution = faster real-time processing and lower latency.",
+                    visible=True,
                 )
                 c["motion_sensitivity"] = gr.Slider(
                     minimum=0.5,
@@ -130,6 +136,12 @@ def _build_realtime_tab() -> Dict[str, Any]:
 def _wire_realtime_events(
     c_real: Dict[str, Any], c_srv: Dict[str, Any], c_bat: Dict[str, Any]
 ):
+    c_real["enable_resizing"].change(
+        fn=lambda enabled: gr.update(visible=enabled),
+        inputs=[c_real["enable_resizing"]],
+        outputs=[c_real["max_resolution"]],
+    )
+
     def toggle_mode(mode, session):
         is_cam = mode == "Webcam Stream"
         fresh_session = reset_session(session)
@@ -162,6 +174,7 @@ def _wire_realtime_events(
             c_bat["ext_api_key"],
             c_bat["ext_model_name"],
             gr.State(0.3),
+            c_real["enable_resizing"],
             c_real["max_resolution"],
             c_real["motion_sensitivity"],
             c_real["stale_refresh"],
@@ -278,6 +291,7 @@ def _wire_realtime_events(
             c_bat["ext_api_url"],
             c_bat["ext_api_key"],
             c_bat["ext_model_name"],
+            c_real["enable_resizing"],
             c_real["max_resolution"],
             c_real["tracker_algorithm"],
         ],

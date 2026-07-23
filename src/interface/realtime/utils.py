@@ -121,9 +121,10 @@ def run_vlm_detect(
     start_time = time.time()
     pil_img = Image.fromarray(frame).convert("RGB")
 
-    # Preprocess image resolution
+    # Preprocess image resolution (or keep native resolution if resizing is disabled)
+    enable_resizing = prep_info.get("enable_resizing", True)
     proc_img, prep_info = preprocess_resolution(
-        pil_img, enabled=True, target_short_edge=prep_info.get("max_res", 640)
+        pil_img, enabled=enable_resizing, target_short_edge=prep_info.get("max_res", 640)
     )
 
     # Apply 0-1000 scale coordinate grid overlay if enabled (matching detection_pipeline)

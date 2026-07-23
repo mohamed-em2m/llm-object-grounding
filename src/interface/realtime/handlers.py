@@ -37,6 +37,7 @@ def process_single_frame(
     ext_api_key: str,
     ext_model_name: str,
     confidence_thresh: float,
+    enable_resizing: bool,
     max_resolution: int,
     motion_sensitivity_pct: float,
     stale_refresh_seconds: float,
@@ -84,7 +85,12 @@ def process_single_frame(
             base_url, api_key, model_name = resolve_endpoint(
                 server_port, use_external_api, ext_api_url, ext_api_key, ext_model_name
             )
-            prep_info = {"max_res": max_res, "orig_w": frame_w, "orig_h": frame_h}
+            prep_info = {
+                "enable_resizing": enable_resizing,
+                "max_res": max_res,
+                "orig_w": frame_w,
+                "orig_h": frame_h,
+            }
             frame_id = session.next_frame_id()
             session.submit(
                 frame_id,
@@ -117,6 +123,7 @@ def process_video_frames(
     ext_api_url: str,
     ext_api_key: str,
     ext_model_name: str,
+    enable_resizing: bool = True,
     max_resolution: int = 640,
     tracker_algorithm: str = "ByteTrack",
     progress=gr.Progress(),
@@ -162,7 +169,12 @@ def process_video_frames(
         progress(
             (idx + 1) / len(frames), desc=f"Detecting frame {idx + 1}/{len(frames)}"
         )
-        prep_info = {"max_res": max_res, "orig_w": f.shape[1], "orig_h": f.shape[0]}
+        prep_info = {
+            "enable_resizing": enable_resizing,
+            "max_res": max_res,
+            "orig_w": f.shape[1],
+            "orig_h": f.shape[0],
+        }
         try:
             boxes, _hud = run_vlm_detect(
                 f, categories, base_url, api_key, model_name, prep_info, True, 250
