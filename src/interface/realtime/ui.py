@@ -57,13 +57,11 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     label="ENABLE IMAGE RESIZING / RESHAPING",
                     info="When unchecked, the image is passed to VLM at native resolution without resizing.",
                 )
-                c["max_resolution"] = gr.Slider(
-                    minimum=384,
-                    maximum=4096,
-                    step=128,
-                    value=640,
+                c["max_resolution"] = gr.Number(
+                    value=1024,
                     label="MAX FRAME RESOLUTION (PX)",
                     info="Lower resolution = faster real-time processing and lower latency.",
+                    precision=0,
                     visible=True,
                 )
                 c["motion_sensitivity"] = gr.Slider(
