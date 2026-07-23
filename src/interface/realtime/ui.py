@@ -51,27 +51,31 @@ def _build_realtime_tab() -> Dict[str, Any]:
                 c["categories_input"] = gr.Textbox(
                     value="person, car, dog, bottle, phone",
                     label="TARGET CATEGORIES (comma-separated)",
+                    info="Leave empty or type * for free/open-vocabulary detection.",
                 )
+
+                # ── Resolution ───────────────────────────────────────────────
                 c["enable_resizing"] = gr.Checkbox(
                     value=True,
-                    label="ENABLE IMAGE RESIZING / RESHAPING",
-                    info="When unchecked, the image is passed to VLM at native resolution without resizing.",
+                    label="ENABLE IMAGE RESIZING",
+                    info="Uncheck to pass native resolution to VLM.",
                 )
                 c["max_resolution"] = gr.Number(
                     value=1024,
                     label="MAX FRAME RESOLUTION (PX)",
-                    info="Lower resolution = faster real-time processing and lower latency.",
+                    info="Target short-edge resolution for the VLM input.",
                     precision=0,
                     visible=True,
                 )
+
+                # ── Motion / Refresh ──────────────────────────────────────────
                 c["motion_sensitivity"] = gr.Slider(
                     minimum=0.5,
                     maximum=10.0,
                     step=0.5,
                     value=1.5,
                     label="MOTION SENSITIVITY (% PIXELS CHANGED)",
-                    info="Webcam mode: a new detection only runs once at least this % of the "
-                    "frame changes (absdiff+threshold). Lower = more sensitive/more model calls.",
+                    info="Lower = more sensitive — more VLM calls.",
                 )
                 c["stale_refresh"] = gr.Slider(
                     minimum=2.0,
@@ -79,8 +83,97 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     step=1.0,
                     value=6.0,
                     label="STALE REFRESH FALLBACK (SECONDS)",
-                    info="Webcam mode: re-detect anyway after this long, even with no motion.",
+                    info="Re-detect anyway after this long even with no motion.",
                 )
+
+                # ── Section A: VLM Image Conditioning ────────────────────────
+                with gr.Accordion("🎨 Section A — VLM Image Conditioning", open=False):
+                    gr.HTML(
+                        '<p style="color:#aaa;font-size:12px;margin:2px 0 8px;">'
+                        "Applied to what the model <em>sees</em> — keeps image clean & consistent."
+                        "</p>"
+                    )
+                    c["vlm_conditioning"] = gr.Checkbox(
+                        value=True,
+                        label="Enable VLM Conditioning Pipeline",
+                        info="Master toggle for CLAHE + White Balance + Bilateral Denoise.",
+                    )
+                    with gr.Group() as c["conditioning_group"]:
+                        c["clahe_enabled"] = gr.Checkbox(
+                            value=True,
+                            label="CLAHE Contrast Normalization",
+                            info="Normalizes uneven lighting (best single win for consistency).",
+                        )
+                        c["clahe_clip"] = gr.Slider(
+                            minimum=0.5, maximum=8.0, step=0.5, value=2.0,
+                            label="CLAHE Clip Limit",
+                            info="Higher = stronger local contrast boost.",
+                        )
+                        c["white_balance"] = gr.Checkbox(
+                            value=True,
+                            label="Gray World White Balance",
+                            info="Corrects color temperature drift between shots.",
+                        )
+                        c["denoise_method"] = gr.Dropdown(
+                            choices=["bilateral", "nlm", "none"],
+                            value="bilateral",
+                            label="Denoise Method",
+                            info="Bilateral preserves defect edges; NLM is stronger but slower.",
+                        )
+                        c["denoise_d"] = gr.Slider(
+                            minimum=3, maximum=15, step=2, value=5,
+                            label="Bilateral Filter Diameter (d)",
+                            info="Larger = stronger smoothing. Keep ≤7 for real-time speed.",
+                        )
+
+                # ── Section B: Pre-Filter Triage ─────────────────────────────
+                with gr.Accordion("🔎 Section B — Pre-Filter Triage (Fast CV)", open=False):
+                    gr.HTML(
+                        '<p style="color:#aaa;font-size:12px;margin:2px 0 8px;">'
+                        "Runs <em>before</em> VLM — reject bad frames fast to save tokens."
+                        "</p>"
+                    )
+                    c["triage_enabled"] = gr.Checkbox(
+                        value=True,
+                        label="Enable Pre-Filter Triage",
+                        info="Master toggle for all triage heuristics below.",
+                    )
+                    with gr.Group() as c["triage_group"]:
+                        c["blur_reject"] = gr.Checkbox(
+                            value=True,
+                            label="Blur Rejection (Laplacian Variance)",
+                            info="Rejects out-of-focus frames before VLM call.",
+                        )
+                        c["blur_laplacian_min"] = gr.Slider(
+                            minimum=5.0, maximum=150.0, step=5.0, value=30.0,
+                            label="Min Laplacian Variance (blur threshold)",
+                            info="Frames with var < this are rejected as blurry.",
+                        )
+                        c["edge_triage"] = gr.Checkbox(
+                            value=True,
+                            label="Canny Edge Density Trigger",
+                            info="Trigger VLM if unusual edge structure detected.",
+                        )
+                        c["edge_density_thresh"] = gr.Slider(
+                            minimum=0.005, maximum=0.2, step=0.005, value=0.02,
+                            label="Edge Density Threshold",
+                        )
+                        c["entropy_triage"] = gr.Checkbox(
+                            value=True,
+                            label="Local Texture Entropy Trigger",
+                            info="Detects texture anomalies (holes, snags, stains).",
+                        )
+                        c["entropy_variance_thresh"] = gr.Slider(
+                            minimum=0.5, maximum=20.0, step=0.5, value=2.0,
+                            label="Entropy Variance Threshold",
+                        )
+                        c["ref_triage"] = gr.Checkbox(
+                            value=True,
+                            label="Difference-from-Reference Trigger",
+                            info="Trigger VLM only when frame differs enough from last submission.",
+                        )
+
+                # ── Video / HUD ───────────────────────────────────────────────
                 c["sample_interval"] = gr.Slider(
                     minimum=0.5,
                     maximum=5.0,
@@ -94,6 +187,7 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     elem_classes=["neo-retro-badge"],
                 )
                 c["hud_status"] = gr.HTML(value=DEFAULT_HUD)
+
             with gr.Column(scale=2):
                 # NOTE: Gradio 6.x strips <script> from gr.HTML for security.
                 # Only inject the CSS here; all canvas JS runs in the .change(js=) handler.
@@ -171,13 +265,29 @@ def _wire_realtime_events(
             c_bat["ext_api_url"],
             c_bat["ext_api_key"],
             c_bat["ext_model_name"],
-            gr.State(0.3),
+            gr.State(0.3),           # confidence_thresh (unused, kept for compat)
             c_real["enable_resizing"],
             c_real["max_resolution"],
             c_real["motion_sensitivity"],
             c_real["stale_refresh"],
             c_real["tracker_algorithm"],
             c_real["session_state"],
+            # Section A — VLM Conditioning
+            c_real["vlm_conditioning"],
+            c_real["clahe_enabled"],
+            c_real["clahe_clip"],
+            c_real["white_balance"],
+            c_real["denoise_method"],
+            c_real["denoise_d"],
+            # Section B — Triage
+            c_real["triage_enabled"],
+            c_real["blur_reject"],
+            c_real["blur_laplacian_min"],
+            c_real["edge_triage"],
+            c_real["edge_density_thresh"],
+            c_real["entropy_triage"],
+            c_real["entropy_variance_thresh"],
+            c_real["ref_triage"],
         ],
         outputs=[
             c_real["boxes_json_state"],

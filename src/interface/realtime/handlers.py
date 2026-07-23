@@ -43,6 +43,22 @@ def process_single_frame(
     stale_refresh_seconds: float,
     tracker_algorithm: str,
     session: SessionDetector,
+    # Section A — VLM Conditioning
+    vlm_conditioning: bool = True,
+    clahe_enabled: bool = True,
+    clahe_clip: float = 2.0,
+    white_balance: bool = True,
+    denoise_method: str = "bilateral",
+    denoise_d: int = 5,
+    # Section B — Triage
+    triage_enabled: bool = True,
+    blur_reject: bool = True,
+    blur_laplacian_min: float = 30.0,
+    edge_triage: bool = True,
+    edge_density_thresh: float = 0.02,
+    entropy_triage: bool = True,
+    entropy_variance_thresh: float = 2.0,
+    ref_triage: bool = True,
 ) -> Tuple[dict, str, SessionDetector]:
     """Continuous Live Streaming Processor called on stream ticks."""
     if session is None:
@@ -59,28 +75,31 @@ def process_single_frame(
     tracked_boxes = session.update_tracking_only(frame, tracker_algorithm)
     hud = session.last_hud
 
-    # 2) Dispatch background detection when ready using Section B triage pre-filter
+    # 2) Dispatch background detection when ready
     if not session.is_busy():
         now = time.time()
         stale = (now - session.last_detect_time) >= max(
             0.5, float(stale_refresh_seconds or 6.0)
         )
 
-        # Run Section B triage pre-filter heuristics (traditional CV)
-        should_process, triage_reason, metrics = triage_frame_check(
-            frame,
-            reference_bgr=session._last_submitted_frame,
-            min_laplacian_var=30.0,
-            edge_density_thresh=0.02,
-            entropy_variance_thresh=2.0,
-            reference_diff_thresh=max(0.005, float(motion_sensitivity_pct or 1.5) / 100.0),
-            enable_blur_reject=True,
-            enable_edge_triage=True,
-            enable_entropy_triage=True,
-            enable_ref_triage=True,
-        )
+        # Section B: Fast CV triage pre-filter
+        if triage_enabled:
+            should_process, triage_reason, metrics = triage_frame_check(
+                frame,
+                reference_bgr=session._last_submitted_frame,
+                min_laplacian_var=float(blur_laplacian_min or 30.0),
+                edge_density_thresh=float(edge_density_thresh or 0.02),
+                entropy_variance_thresh=float(entropy_variance_thresh or 2.0),
+                reference_diff_thresh=max(0.005, float(motion_sensitivity_pct or 1.5) / 100.0),
+                enable_blur_reject=bool(blur_reject),
+                enable_edge_triage=bool(edge_triage),
+                enable_entropy_triage=bool(entropy_triage),
+                enable_ref_triage=bool(ref_triage),
+            )
+        else:
+            should_process, triage_reason, metrics = True, "Triage disabled", {}
 
-        if (should_process or stale) and not (enable_blur_reject_flag := (metrics.get("laplacian_var", 999.0) < 30.0)):
+        if should_process or stale:
             session._last_submitted_frame = frame.copy()
             max_res = int(max_resolution or 640)
             categories = [
@@ -94,6 +113,13 @@ def process_single_frame(
                 "max_res": max_res,
                 "orig_w": frame_w,
                 "orig_h": frame_h,
+                # Section A conditioning params
+                "vlm_conditioning": vlm_conditioning,
+                "clahe_enabled": clahe_enabled,
+                "clahe_clip": clahe_clip,
+                "white_balance": white_balance,
+                "denoise_method": denoise_method,
+                "denoise_d": denoise_d,
             }
             frame_id = session.next_frame_id()
             session.submit(
@@ -105,10 +131,9 @@ def process_single_frame(
                 api_key,
                 model_name,
                 prep_info,
-                True,  # enable_grid
-                100,  # grid_step
+                True,   # enable_grid
+                100,    # grid_step
             )
-            session.reference_gray = gray_small
             session.last_detect_time = now
 
     return (
