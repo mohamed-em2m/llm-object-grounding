@@ -90,9 +90,17 @@ class SessionDetector:
     reference_gray: Optional[Any] = None
     last_detect_time: float = 0.0
     _last_submitted_frame: Optional[Any] = None
+    force_redetect: bool = False   # set True by _run_and_store; cleared by consume_force_redetect()
 
     def next_frame_id(self) -> int:
         return next(self._frame_counter)
+
+    def consume_force_redetect(self) -> bool:
+        """Returns True (and clears the flag) if a fresh VLM result arrived since last call."""
+        with self.lock:
+            flag = self.force_redetect
+            self.force_redetect = False
+            return flag
 
     def is_busy(self) -> bool:
         with self.lock:
@@ -125,6 +133,8 @@ class SessionDetector:
                     self.last_tracked_boxes = self.multi_tracker.update_with_detections(
                         frame_bgr, boxes
                     )
+                    # Signal the stream loop to re-detect immediately on next tick
+                    self.force_redetect = True
                 self.last_hud = hud
 
     def update_tracking_only(self, frame: Optional[Any], algorithm: str) -> List[Any]:

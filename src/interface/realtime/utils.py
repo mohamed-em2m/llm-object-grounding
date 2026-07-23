@@ -162,6 +162,27 @@ def run_vlm_detect(
         )
 
     # Apply 0-1000 scale coordinate grid overlay if enabled (matching detection_pipeline)
+    # Step 3: Contrast enhancement (gamma / CLAHE-contrast) — same as pipeline step 3
+    contrast_method = prep_info.get("contrast_method", "none")
+    gamma_val = float(prep_info.get("gamma", 1.0))
+    clahe_clip_for_contrast = float(prep_info.get("clahe_clip", 2.0))
+    proc_img = preprocess_contrast(
+        proc_img,
+        method=contrast_method,
+        clip_limit=clahe_clip_for_contrast,
+        gamma=gamma_val,
+    )
+
+    # Step 4: Noise filtering and optional sharpening — same as pipeline step 4
+    noise_method = prep_info.get("noise_method", "none")
+    sharpen = bool(prep_info.get("sharpen", False))
+    proc_img = preprocess_noise_sharpness(
+        proc_img,
+        method=noise_method,
+        sharpen=sharpen,
+    )
+
+    # Step 5: Grid overlay
     if enable_grid:
         input_img = draw_grid(
             proc_img,

@@ -68,7 +68,13 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     visible=True,
                 )
 
-                # ── Motion / Refresh ──────────────────────────────────────────
+                # ── Motion Gate + Refresh ─────────────────────────────────────
+                c["motion_gate_enabled"] = gr.Checkbox(
+                    value=True,
+                    label="⚡ MOTION GATE (Scene-Change Gating)",
+                    info="ON: only re-detect when scene changes or stale timer fires. "
+                         "OFF: re-detect as fast as GPU can respond (no scene-change check).",
+                )
                 c["motion_sensitivity"] = gr.Slider(
                     minimum=0.5,
                     maximum=10.0,
@@ -78,12 +84,12 @@ def _build_realtime_tab() -> Dict[str, Any]:
                     info="Lower = more sensitive — more VLM calls.",
                 )
                 c["stale_refresh"] = gr.Slider(
-                    minimum=2.0,
+                    minimum=1.0,
                     maximum=20.0,
-                    step=1.0,
-                    value=6.0,
+                    step=0.5,
+                    value=3.0,
                     label="STALE REFRESH FALLBACK (SECONDS)",
-                    info="Re-detect anyway after this long even with no motion.",
+                    info="Re-detect anyway after this long even with no motion. Ignored when Motion Gate is OFF.",
                 )
 
                 # ── Section A: VLM Image Conditioning ────────────────────────
@@ -125,6 +131,36 @@ def _build_realtime_tab() -> Dict[str, Any]:
                             label="Bilateral Filter Diameter (d)",
                             info="Larger = stronger smoothing. Keep ≤7 for real-time speed.",
                         )
+
+                    gr.HTML('<hr style="border-color:#444;margin:8px 0;">')
+                    gr.HTML(
+                        '<p style="color:#aaa;font-size:12px;margin:2px 0 6px;">'
+                        "<b>Pipeline Parity</b> — steps 3 &amp; 4 from detection_pipeline.py"
+                        "</p>"
+                    )
+                    c["contrast_method"] = gr.Dropdown(
+                        choices=["none", "clahe", "gamma", "autocontrast"],
+                        value="none",
+                        label="Contrast Enhancement Method",
+                        info="'clahe' = adaptive equalization; 'gamma' = brightness curve; 'none' = skip.",
+                    )
+                    c["gamma"] = gr.Number(
+                        value=1.0,
+                        label="Gamma Value",
+                        info="< 1.0 = brighten shadows; > 1.0 = darken. Used only when method = gamma.",
+                        precision=2,
+                    )
+                    c["noise_method"] = gr.Dropdown(
+                        choices=["none", "bilateral", "nlm", "gaussian"],
+                        value="none",
+                        label="Noise Filter Method (Step 4)",
+                        info="Applied after contrast. 'none' skips; 'bilateral' best for edge detail.",
+                    )
+                    c["sharpen"] = gr.Checkbox(
+                        value=False,
+                        label="Unsharp Mask Sharpening",
+                        info="Enhances edges after denoising. Useful for crisp defect boundaries.",
+                    )
 
                 # ── Section B: Pre-Filter Triage ─────────────────────────────
                 with gr.Accordion("🔎 Section B — Pre-Filter Triage (Fast CV)", open=False):
@@ -265,13 +301,15 @@ def _wire_realtime_events(
             c_bat["ext_api_url"],
             c_bat["ext_api_key"],
             c_bat["ext_model_name"],
-            gr.State(0.3),           # confidence_thresh (unused, kept for compat)
+            gr.State(0.3),               # confidence_thresh (unused, kept for compat)
             c_real["enable_resizing"],
             c_real["max_resolution"],
             c_real["motion_sensitivity"],
             c_real["stale_refresh"],
             c_real["tracker_algorithm"],
             c_real["session_state"],
+            # Motion gate master toggle
+            c_real["motion_gate_enabled"],
             # Section A — VLM Conditioning
             c_real["vlm_conditioning"],
             c_real["clahe_enabled"],
@@ -279,6 +317,11 @@ def _wire_realtime_events(
             c_real["white_balance"],
             c_real["denoise_method"],
             c_real["denoise_d"],
+            # Pipeline parity — Contrast (step 3) + Noise/Sharpen (step 4)
+            c_real["contrast_method"],
+            c_real["gamma"],
+            c_real["noise_method"],
+            c_real["sharpen"],
             # Section B — Triage
             c_real["triage_enabled"],
             c_real["blur_reject"],

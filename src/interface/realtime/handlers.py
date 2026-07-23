@@ -43,6 +43,8 @@ def process_single_frame(
     stale_refresh_seconds: float,
     tracker_algorithm: str,
     session: SessionDetector,
+    # Motion gate master toggle
+    motion_gate_enabled: bool = True,
     # Section A — VLM Conditioning
     vlm_conditioning: bool = True,
     clahe_enabled: bool = True,
@@ -50,6 +52,11 @@ def process_single_frame(
     white_balance: bool = True,
     denoise_method: str = "bilateral",
     denoise_d: int = 5,
+    # Pipeline parity — contrast + noise (same as detection_pipeline.py steps 3 & 4)
+    contrast_method: str = "none",
+    gamma: float = 1.0,
+    noise_method: str = "none",
+    sharpen: bool = False,
     # Section B — Triage
     triage_enabled: bool = True,
     blur_reject: bool = True,
@@ -78,28 +85,38 @@ def process_single_frame(
     # 2) Dispatch background detection when ready
     if not session.is_busy():
         now = time.time()
-        stale = (now - session.last_detect_time) >= max(
-            0.5, float(stale_refresh_seconds or 6.0)
-        )
+        stale_secs = max(0.5, float(stale_refresh_seconds or 6.0))
+        stale = (now - session.last_detect_time) >= stale_secs
 
-        # Section B: Fast CV triage pre-filter
-        if triage_enabled:
-            should_process, triage_reason, metrics = triage_frame_check(
-                frame,
-                reference_bgr=session._last_submitted_frame,
-                min_laplacian_var=float(blur_laplacian_min or 30.0),
-                edge_density_thresh=float(edge_density_thresh or 0.02),
-                entropy_variance_thresh=float(entropy_variance_thresh or 2.0),
-                reference_diff_thresh=max(0.005, float(motion_sensitivity_pct or 1.5) / 100.0),
-                enable_blur_reject=bool(blur_reject),
-                enable_edge_triage=bool(edge_triage),
-                enable_entropy_triage=bool(entropy_triage),
-                enable_ref_triage=bool(ref_triage),
-            )
+        # Check if a fresh VLM result just arrived — re-detect immediately regardless of triage/stale
+        fresh_result = session.consume_force_redetect()
+
+        if fresh_result:
+            # Immediately re-detect: skip triage and stale checks
+            should_dispatch = True
+        elif not motion_gate_enabled:
+            # Motion gate OFF — always dispatch (rate limited only by server response time)
+            should_dispatch = stale  # still respect stale to avoid hammering on startup
         else:
-            should_process, triage_reason, metrics = True, "Triage disabled", {}
+            # Section B: Fast CV triage pre-filter
+            if triage_enabled:
+                should_process, triage_reason, metrics = triage_frame_check(
+                    frame,
+                    reference_bgr=session._last_submitted_frame,
+                    min_laplacian_var=float(blur_laplacian_min or 30.0),
+                    edge_density_thresh=float(edge_density_thresh or 0.02),
+                    entropy_variance_thresh=float(entropy_variance_thresh or 2.0),
+                    reference_diff_thresh=max(0.005, float(motion_sensitivity_pct or 1.5) / 100.0),
+                    enable_blur_reject=bool(blur_reject),
+                    enable_edge_triage=bool(edge_triage),
+                    enable_entropy_triage=bool(entropy_triage),
+                    enable_ref_triage=bool(ref_triage),
+                )
+            else:
+                should_process, triage_reason, metrics = True, "Triage disabled", {}
+            should_dispatch = should_process or stale
 
-        if should_process or stale:
+        if should_dispatch:
             session._last_submitted_frame = frame.copy()
             max_res = int(max_resolution or 640)
             categories = [
@@ -120,6 +137,11 @@ def process_single_frame(
                 "white_balance": white_balance,
                 "denoise_method": denoise_method,
                 "denoise_d": denoise_d,
+                # Pipeline parity params (steps 3 & 4)
+                "contrast_method": contrast_method,
+                "gamma": gamma,
+                "noise_method": noise_method,
+                "sharpen": sharpen,
             }
             frame_id = session.next_frame_id()
             session.submit(
