@@ -54,7 +54,7 @@ def _build_realtime_tab() -> Dict[str, Any]:
                 )
                 c["max_resolution"] = gr.Slider(
                     minimum=384,
-                    maximum=1084,
+                    maximum=4096,
                     step=128,
                     value=640,
                     label="MAX FRAME RESOLUTION (PX)",
